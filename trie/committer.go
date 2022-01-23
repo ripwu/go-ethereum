@@ -73,6 +73,7 @@ func returnCommitterToPool(h *committer) {
 }
 
 // Commit collapses a node down into a hash node and inserts it into the database
+// 这段代码要放在 Trie.Commit() 函数中理解：它在 Trie.Hash() 之后被调用
 func (c *committer) Commit(n node, db *Database) (hashNode, int, error) {
 	if db == nil {
 		return nil, 0, errors.New("no db provided")
@@ -105,10 +106,19 @@ func (c *committer) commit(n node, db *Database) (node, int, error) {
 			if err != nil {
 				return nil, 0, err
 			}
+
+			// XXX 注意这里：如果 Val 原本指向 分支节点，在这里会被修改为 childV (大部分情况下，此时 childV 应该是 hashNode 类型)
+			// 隐藏的意思：如果 Val 原本指向 valueNode 或 hashNode，此时不变
 			collapsed.Val, childCommitted = childV, committed
 		}
+
 		// The key needs to be copied, since we're delivering it to database
 		collapsed.Key = hexToCompact(cn.Key)
+
+		// 可以看到，在 insert 之前只有 Key 改成 Compact 编码，Val 是未修改的，因此保持原有的编码
+		// 如果当前节点为叶子节点，Val 原有编码是什么? 感觉理论上要看当前这棵树的类型，但对于 State Trie 或 Storage Trie 的实际使用：
+		// 如果是 State Trie，那么调用入口为 Trie.TryUpdateAccount()，参数为 types.StateAccount 四元组，该函数内部会先调用 rlp.EncodeToBytes 将其转为 []byte
+		// 如果是 Storage Trie，那么调用来源为 stateObject.updateTrie()，该函数在调用 Trie.TryUpdate() 前，会先调用 rlp.EncodeToBytes 将 value 转为 []byte
 		hashedNode := c.store(collapsed, db)
 		if hn, ok := hashedNode.(hashNode); ok {
 			return hn, childCommitted + 1, nil
@@ -119,6 +129,7 @@ func (c *committer) commit(n node, db *Database) (node, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
+
 		collapsed := cn.copy()
 		collapsed.Children = hashedKids
 
@@ -128,6 +139,7 @@ func (c *committer) commit(n node, db *Database) (node, int, error) {
 		}
 		return collapsed, childCommitted, nil
 	case hashNode:
+		// 理解：如果是 hashNode，说明 db 中的数据已经是最新的了，因此不需要再展开了
 		return cn, 0, nil
 	default:
 		// nil, valuenode shouldn't be committed
@@ -173,6 +185,7 @@ func (c *committer) commitChildren(n *fullNode, db *Database) ([17]node, int, er
 // store hashes the node n and if we have a storage layer specified, it writes
 // the key/value pair to it and tracks any node->child references as well as any
 // node->external trie references.
+// 传入要存储的 n 节点，可能原样返回 n 节点，或者返回 n.nodeFlag.cache 存储的 hashNode
 func (c *committer) store(n node, db *Database) node {
 	// Larger nodes are replaced by their hash and stored in the database.
 	var (
@@ -180,6 +193,13 @@ func (c *committer) store(n node, db *Database) node {
 		size    int
 	)
 	if hash == nil {
+		// 调用来源为 Trie.Commit() -> Trie.Hash(), h.Commit() -> h.store()，即调用当前函数前，
+		// 肯定先调用了 Trie.Hash() 计算了每个节点的 RLP 编码后的哈希并保存在 nodeFlags.cache 中；
+		// 因此，如果这里为 nil，说明 Key + Val 编码少于 32 字节，即少于一个 hashNode 的大小，此时直接 return n
+
+		// XXX 注意这里：因为直接 return，所以当前 n 不会被直接 insert()，但它会被嵌入到上层节
+		// 点中，如 (fullNode.children[X])；在上层节点被 insert() 时，隐含 insert 了 当前节点
+
 		// This was not generated - must be a small node stored in the parent.
 		// In theory, we should apply the leafCall here if it's not nil(embedded
 		// node usually contains value). But small value(less than 32bytes) is
@@ -190,19 +210,25 @@ func (c *committer) store(n node, db *Database) node {
 		// The size is used for mem tracking, does not need to be exact
 		size = estimateSize(n)
 	}
+
 	// If we're using channel-based leaf-reporting, send to channel.
 	// The leaf channel will be active only when there an active leaf-callback
 	if c.leafCh != nil {
+		// 这里不管 node 是什么类型，都会写入 leafCh
+		// commitLoop() 在处理 leafCh 时，实际回调前会检查 node 类型为叶子节点
 		c.leafCh <- &leaf{
 			size: size,
-			hash: common.BytesToHash(hash),
-			node: n,
+			hash: common.BytesToHash(hash), // 哈希
+			node: n, // 实际节点内容
 		}
 	} else if db != nil {
 		// No leaf-callback used, but there's still a database. Do serial
 		// insertion
 		db.lock.Lock()
+
+		// 哈希 和 实际节点内容
 		db.insert(common.BytesToHash(hash), size, n)
+
 		db.lock.Unlock()
 	}
 	return hash
@@ -221,6 +247,7 @@ func (c *committer) commitLoop(db *Database) {
 		db.insert(hash, size, n)
 		db.lock.Unlock()
 
+		// 这里判断为叶子节点，才真的回调
 		if c.onleaf != nil {
 			switch n := n.(type) {
 			case *shortNode:

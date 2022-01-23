@@ -40,6 +40,8 @@ func (its weightedIterators) Len() int { return len(its) }
 
 // Less implements sort.Interface, returning which of two iterators in the stack
 // is before the other.
+// 按 account hash 和 priority 排序，小的在前 (priority 为 layer 的深度，越小表示 layer 越新)
+// TODO 为什么会有相同的 account hash?
 func (its weightedIterators) Less(i, j int) bool {
 	// Order the iterators primarily by the account hashes
 	hashI := its[i].it.Hash()
@@ -51,6 +53,7 @@ func (its weightedIterators) Less(i, j int) bool {
 	case 1:
 		return false
 	}
+
 	// Same account/storage-slot in multiple layers, split by priority
 	return its[i].priority < its[j].priority
 }
@@ -166,6 +169,7 @@ func (fi *fastIterator) init() {
 			}
 		}
 	}
+
 	// Re-sort the entire list
 	sort.Sort(fi.iterators)
 	fi.initiated = false

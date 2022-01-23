@@ -76,6 +76,7 @@ func NewEVMTxContext(msg Message) vm.TxContext {
 func GetHashFn(ref *types.Header, chain ChainContext) func(n uint64) common.Hash {
 	// Cache will initially contain [refHash.parent],
 	// Then fill up with [refHash.p, refHash.pp, refHash.ppp, ...]
+	// 数据记忆在闭包中..
 	var cache []common.Hash
 
 	return func(n uint64) common.Hash {

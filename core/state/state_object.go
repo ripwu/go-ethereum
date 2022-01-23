@@ -147,6 +147,10 @@ func (s *stateObject) touch() {
 	}
 }
 
+// 打开 storage Trie
+// 两个合约的 storageRoot 可以相同，此时他们指向数据库同一条数据
+// 参考 Storage trie - are trie nodes reused for two contract instances with the same storage content?
+// https://ethereum.stackexchange.com/questions/41464/storage-trie-are-trie-nodes-reused-for-two-contract-instances-with-the-same-st
 func (s *stateObject) getTrie(db Database) Trie {
 	if s.trie == nil {
 		// Try fetching from prefetcher first
@@ -301,6 +305,7 @@ func (s *stateObject) setState(key, value common.Hash) {
 
 // finalise moves all dirty storage slots into the pending area to be hashed or
 // committed later. It is invoked at the end of every transaction.
+// 将 dirtyStorage 写入 pendingStorage
 func (s *stateObject) finalise(prefetch bool) {
 	slotsToPrefetch := make([][]byte, 0, len(s.dirtyStorage))
 	for key, value := range s.dirtyStorage {
@@ -319,6 +324,7 @@ func (s *stateObject) finalise(prefetch bool) {
 
 // updateTrie writes cached storage modifications into the object's storage trie.
 // It will return nil if the trie has not been loaded and no changes have been made
+// 将 pendingStorage 写入 originStorage
 func (s *stateObject) updateTrie(db Database) Trie {
 	// Make sure all dirty slots are finalized into the pending storage area
 	s.finalise(false) // Don't prefetch anymore, pull directly if need be
@@ -331,11 +337,14 @@ func (s *stateObject) updateTrie(db Database) Trie {
 	}
 	// The snapshot storage map for the object
 	var storage map[common.Hash][]byte
+
 	// Insert all the pending updates into the trie
+	// 这个 tr 是 当前账户对应的storageTrie
 	tr := s.getTrie(db)
 	hasher := s.db.hasher
 
 	usedStorage := make([][]byte, 0, len(s.pendingStorage))
+	// pendingStorage 写入 originStorage，并提交到 tr
 	for key, value := range s.pendingStorage {
 		// Skip noop changes, persist actual changes
 		if value == s.originStorage[key] {
@@ -343,12 +352,14 @@ func (s *stateObject) updateTrie(db Database) Trie {
 		}
 		s.originStorage[key] = value
 
+		// 注意这里通过 tr.TryDelete 或者 tr.TryUpdate 将 <key, v> 提交到了 storageTrie
 		var v []byte
 		if (value == common.Hash{}) {
 			s.setError(tr.TryDelete(key[:]))
 			s.db.StorageDeleted += 1
 		} else {
 			// Encoding []byte cannot fail, ok to ignore the error.
+			// 把前面的 0 给 trim 掉
 			v, _ = rlp.EncodeToBytes(common.TrimLeftZeroes(value[:]))
 			s.setError(tr.TryUpdate(key[:], v))
 			s.db.StorageUpdated += 1

@@ -63,6 +63,7 @@ func GenerateStorageTrieRoot(account common.Hash, it StorageIterator) (common.Ha
 // GenerateTrie takes the whole snapshot tree as the input, traverses all the
 // accounts as well as the corresponding storages and regenerate the whole state
 // (account trie + all storage tries).
+// 通过 Tree 构造 State Trie 和 Storage Trie
 func GenerateTrie(snaptree *Tree, root common.Hash, src ethdb.Database, dst ethdb.KeyValueWriter) error {
 	// Traverse all state by snapshot, re-generate the whole state trie
 	acctIt, err := snaptree.AccountIterator(root, common.Hash{})

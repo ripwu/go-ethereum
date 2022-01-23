@@ -31,7 +31,10 @@ import (
 // diskLayer is a low level persistent snapshot built on top of a key-value store.
 type diskLayer struct {
 	diskdb ethdb.KeyValueStore // Key-value store containing the base snapshot
+
+	// TODO 具体怎样使用
 	triedb *trie.Database      // Trie node cache for reconstruction purposes
+
 	cache  *fastcache.Cache    // Cache to avoid hitting the disk for direct access
 
 	root  common.Hash // Root hash of the base snapshot
@@ -91,11 +94,15 @@ func (dl *diskLayer) AccountRLP(hash common.Hash) ([]byte, error) {
 	if dl.stale {
 		return nil, ErrSnapshotStale
 	}
+
 	// If the layer is being generated, ensure the requested hash has already been
 	// covered by the generator.
+	// 从这里看起来，snapshot 是对 Account 的 Hashes 做了从小到大排序处理的，genMarker 表示处理到哪个 Account Hash
+	// bytes.Compare() > 0 的意思是，还没处理到 hash[:]
 	if dl.genMarker != nil && bytes.Compare(hash[:], dl.genMarker) > 0 {
 		return nil, ErrNotCoveredYet
 	}
+
 	// If we're in the disk layer, all diff layers missed
 	snapshotDirtyAccountMissMeter.Mark(1)
 
@@ -129,6 +136,7 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 	if dl.stale {
 		return nil, ErrSnapshotStale
 	}
+
 	key := append(accountHash[:], storageHash[:]...)
 
 	// If the layer is being generated, ensure the requested hash has already been
@@ -136,17 +144,23 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 	if dl.genMarker != nil && bytes.Compare(key, dl.genMarker) > 0 {
 		return nil, ErrNotCoveredYet
 	}
+
 	// If we're in the disk layer, all diff layers missed
 	snapshotDirtyStorageMissMeter.Mark(1)
 
 	// Try to retrieve the storage slot from the memory cache
+	// 从缓存中查询
 	if blob, found := dl.cache.HasGet(nil, key); found {
 		snapshotCleanStorageHitMeter.Mark(1)
 		snapshotCleanStorageReadMeter.Mark(int64(len(blob)))
 		return blob, nil
 	}
+
 	// Cache doesn't contain storage slot, pull from disk and cache for later
+	// 从底层数据库查询
 	blob := rawdb.ReadStorageSnapshot(dl.diskdb, accountHash, storageHash)
+
+	// 写入缓存
 	dl.cache.Set(key, blob)
 
 	snapshotCleanStorageMissMeter.Mark(1)
@@ -155,6 +169,7 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 	} else {
 		snapshotCleanStorageInexMeter.Mark(1)
 	}
+
 	return blob, nil
 }
 

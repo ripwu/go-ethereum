@@ -65,6 +65,8 @@ func returnHasherToPool(h *hasher) {
 
 // hash collapses a node down into a hash node, also returning a copy of the
 // original node initialized with the computed hash to replace the original one.
+// @param force 只在 hashRoot() 时设置为 true
+// 将 node 下的所有节点坍缩为一个 hashNode
 func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 	// Return the cached hash if it's available
 	if hash, _ := n.cache(); hash != nil {
@@ -75,6 +77,9 @@ func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 	case *shortNode:
 		collapsed, cached := h.hashShortNodeChildren(n)
 		hashed := h.shortnodeToHash(collapsed, force)
+
+		// 如果 len(rlp(collapsed)) < 32，此时 hashed 是 collapsed RLP 的值，而非计算后的 kec(rlp(collapsed)) 对应的 hashNode
+
 		// We need to retain the possibly _not_ hashed node, in case it was too
 		// small to be hashed
 		if hn, ok := hashed.(hashNode); ok {
@@ -101,6 +106,10 @@ func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 // hashShortNodeChildren collapses the short node. The returned collapsed node
 // holds a live reference to the Key, and must not be modified.
 // The cached
+// @return collapsed 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 为 Compact 编码；
+//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
+// @return cached 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 保持 HEX 编码不变；
+//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
 func (h *hasher) hashShortNodeChildren(n *shortNode) (collapsed, cached *shortNode) {
 	// Hash the short node's child, caching the newly hashed subtree
 	collapsed, cached = n.copy(), n.copy()
@@ -116,6 +125,10 @@ func (h *hasher) hashShortNodeChildren(n *shortNode) (collapsed, cached *shortNo
 	return collapsed, cached
 }
 
+// @return collapsed 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 为 Compact 编码；
+//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
+// @return cached 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 保持 HEX 编码不变；
+//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
 func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached *fullNode) {
 	// Hash the full node's children, caching the newly hashed subtrees
 	cached = n.copy()
@@ -137,6 +150,7 @@ func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached 
 		}
 		wg.Wait()
 	} else {
+		// 第 17 个节点一定是 valueNode，不需要坍缩
 		for i := 0; i < 16; i++ {
 			if child := n.Children[i]; child != nil {
 				collapsed.Children[i], cached.Children[i] = h.hash(child, false)
@@ -151,7 +165,7 @@ func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached 
 // shortnodeToHash creates a hashNode from a shortNode. The supplied shortnode
 // should have hex-type Key, which will be converted (without modification)
 // into compact form for RLP encoding.
-// If the rlp data is smaller than 32 bytes, `nil` is returned.
+// If the rlp data is smaller than 32 bytes, `n` is returned.
 func (h *hasher) shortnodeToHash(n *shortNode, force bool) node {
 	h.tmp.Reset()
 	if err := rlp.Encode(&h.tmp, n); err != nil {
@@ -164,7 +178,7 @@ func (h *hasher) shortnodeToHash(n *shortNode, force bool) node {
 	return h.hashData(h.tmp)
 }
 
-// shortnodeToHash is used to creates a hashNode from a set of hashNodes, (which
+// fullnodeToHash is used to create a hashNode from a set of hashNodes, (which
 // may contain nil values)
 func (h *hasher) fullnodeToHash(n *fullNode, force bool) node {
 	h.tmp.Reset()

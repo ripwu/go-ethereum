@@ -891,6 +891,8 @@ func (diff *StateOverride) Apply(state *state.StateDB) error {
 	return nil
 }
 
+// DoCall [Ask about Geth: Snapshot acceleration](https://blog.ethereum.org/2020/07/17/ask-about-geth-snapshot-acceleration/)
+// When a node operator retrieves state (e.g. eth_call and family), EVM code execution only does reads (it can write too, but those get discarded at the end and are not persisted).
 func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, timeout time.Duration, globalGasCap uint64) (*core.ExecutionResult, error) {
 	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
 

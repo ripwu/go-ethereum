@@ -69,6 +69,9 @@ type Trie struct {
 }
 
 // newFlag returns the cache flag value for a newly created node.
+// 注意代码中有两种创建 nodeFlag 的方式
+// 这里 newFlag() 初始化 dirty 为 true
+// 还可能不调用该函数，而是直接初始化结构体 nodeFlag{}，此时除非指定，否则 dirty 都是默认值 false
 func (t *Trie) newFlag() nodeFlag {
 	return nodeFlag{dirty: true}
 }
@@ -116,6 +119,7 @@ func (t *Trie) Get(key []byte) []byte {
 // The value bytes must not be modified by the caller.
 // If a node was not found in the database, a MissingNodeError is returned.
 func (t *Trie) TryGet(key []byte) ([]byte, error) {
+	// 调用时 Trie* t 总是根，因此 pos 为 0
 	value, newroot, didResolve, err := t.tryGet(t.root, keybytesToHex(key), 0)
 	if err == nil && didResolve {
 		t.root = newroot
@@ -123,13 +127,19 @@ func (t *Trie) TryGet(key []byte) ([]byte, error) {
 	return value, err
 }
 
+// @param pos 路径匹配到哪了
+// @return disResolve 看起来只在 hashNode 中展开子树时返回 true，表示从 db 中加载了新的节点
 func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode node, didResolve bool, err error) {
 	switch n := (origNode).(type) {
 	case nil:
 		return nil, nil, false, nil
 	case valueNode:
+		// 叶子节点
 		return n, n, false, nil
 	case *shortNode:
+		// 不存在
+		//    剩余未匹配的 key ，长度比当前节点的 Key 还小
+		// || 剩余未匹配的 key，不包括当前节点的 Key
 		if len(key)-pos < len(n.Key) || !bytes.Equal(n.Key, key[pos:pos+len(n.Key)]) {
 			// key not found in trie
 			return nil, n, false, nil
@@ -141,6 +151,7 @@ func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode
 		}
 		return value, n, didResolve, err
 	case *fullNode:
+		// 分支节点，匹配一字节
 		value, newnode, didResolve, err = t.tryGet(n.Children[key[pos]], key, pos+1)
 		if err == nil && didResolve {
 			n = n.copy()
@@ -148,10 +159,13 @@ func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode
 		}
 		return value, n, didResolve, err
 	case hashNode:
+		// 节点是个 32 字节的 hashNode 类型
+		// 从 db 中加载后展开，得到一颗子树
 		child, err := t.resolveHash(n, key[:pos])
 		if err != nil {
 			return nil, n, true, err
 		}
+		// 在子树中继续查找
 		value, newnode, _, err := t.tryGet(child, key, pos)
 		return value, newnode, true, err
 	default:
@@ -283,7 +297,15 @@ func (t *Trie) TryUpdate(key, value []byte) error {
 	return nil
 }
 
+// @param n 在哪个节点插入 (可能分叉，此时当前 n 节点作为新建的分支节点的子节点)
+// @return bool dirty/success
+// @return node 新的 root (比如 n 为 hashNode 时需要展开)
 func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error) {
+	// 理解
+	// insert 调用来源有两个，分别为 Trie.TryUpdate 和 insert 递归
+	// 对于 TryUpdate 而言，正常而言 len(key) 不可能为 0 (感觉除非是替换整颗树)
+	// 所以只可能在 insert 递归时 len(key) == 0，此时表示原有路径已经被匹配完，
+	// 因此不新建 shortNode (shortNode 要求有 key)，而是直接返回 value (可能是 n.Val，在 shortNode 分叉代码第一部分传入)
 	if len(key) == 0 {
 		if v, ok := n.(valueNode); ok {
 			return !bytes.Equal(v, value.(valueNode)), value, nil
@@ -300,24 +322,36 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 			if !dirty || err != nil {
 				return false, n, err
 			}
+
+			// 返回新创建的节点
 			return true, &shortNode{n.Key, nn, t.newFlag()}, nil
 		}
+
+		// 发生分叉
 		// Otherwise branch out at the index where they differ.
 		branch := &fullNode{flags: t.newFlag()}
 		var err error
+
+		// 注意 t.insert 时的参数
+		// prefix 没看懂为什么要 matchlen + 1 而非 matchlen 但不影响，因为 n 传 nil，所以 prefix 实际用不上
+		// key 为分叉字符的下一位 (因为分叉字符已经作为分支节点的下标隐藏表示了)，所以为 matchlen + 1
 		_, branch.Children[n.Key[matchlen]], err = t.insert(nil, append(prefix, n.Key[:matchlen+1]...), n.Key[matchlen+1:], n.Val)
 		if err != nil {
 			return false, nil, err
 		}
+
 		_, branch.Children[key[matchlen]], err = t.insert(nil, append(prefix, key[:matchlen+1]...), key[matchlen+1:], value)
 		if err != nil {
 			return false, nil, err
 		}
+
 		// Replace this shortNode with the branch if it occurs at index 0.
 		if matchlen == 0 {
 			return true, branch, nil
 		}
+
 		// Otherwise, replace it with a short node leading up to the branch.
+		// 返回新的 shortNode，Val 指向上面新建的 branchNode
 		return true, &shortNode{key[:matchlen], branch, t.newFlag()}, nil
 
 	case *fullNode:
@@ -517,13 +551,24 @@ func (t *Trie) resolveHash(n hashNode, prefix []byte) (node, error) {
 // Hash returns the root hash of the trie. It does not write to the
 // database and can be used even if the trie doesn't have one.
 func (t *Trie) Hash() common.Hash {
+	// hash 是整棵树不断自底向上坍缩得到的 hashNode
 	hash, cached, _ := t.hashRoot()
+
+	// cached 是递归过程中新构建的一颗树，树结构与原来的 t.root 完全一致
+	// 唯一的区别在于每个 node的 nodeFlags 记录了自己子树计算出来的 hash
+	// 注意：cached.nodeFlags.dirty 不一定为 true
+	// 因为有点节点是从 db 中加载后展开的，如果子树未修改，那么它下面的节点是干净的，dirty 为 false
 	t.root = cached
+
 	return common.BytesToHash(hash.(hashNode))
 }
 
 // Commit writes all nodes to the trie's memory database, tracking the internal
 // and external (for account tries) references.
+// 两个调用来源：
+//   StateDB.Commit() 提交 StateTrie，此时会传 onleaf 回调
+//   StateObject.CommitTrie()，此时不传 onleaf 回调
+// @return common.Hash 整棵 trie 树的根 hash
 func (t *Trie) Commit(onleaf LeafCallback) (common.Hash, int, error) {
 	if t.db == nil {
 		panic("commit called on trie with nil database")
@@ -531,9 +576,13 @@ func (t *Trie) Commit(onleaf LeafCallback) (common.Hash, int, error) {
 	if t.root == nil {
 		return emptyRoot, 0, nil
 	}
+
 	// Derive the hash for all dirty nodes first. We hold the assumption
 	// in the following procedure that all nodes are hashed.
+	// XXX 注意这里：后面的所有操作，都假设所有节点已经 hash
+	// 根据注释，感觉可以推论出 h.Commit() 也依赖于这个假设；否则，Committer.store() 看起来有点难懂...
 	rootHash := t.Hash()
+
 	h := newCommitter()
 	defer returnCommitterToPool(h)
 
@@ -543,6 +592,11 @@ func (t *Trie) Commit(onleaf LeafCallback) (common.Hash, int, error) {
 	if _, dirty := t.root.cache(); !dirty {
 		return rootHash, 0, nil
 	}
+
+	// 这里开一个协程来并发，分割 Committer.Commit() 和 Committer.commitLoop() 两个操作
+	// 主要原因在于回调 onleaf 时，可能有 CPU 消耗的操作，如 RLP.DecodeBytes(leaf, types.StateAccount)，参考 StateDB.Commit()
+	// 这里将 onleaf 回调放在新开的协程中，部分提升性能 (主协程调用 Committer.Commit() 递归时不处理回调)
+
 	var wg sync.WaitGroup
 	if onleaf != nil {
 		h.onleaf = onleaf
@@ -550,21 +604,35 @@ func (t *Trie) Commit(onleaf LeafCallback) (common.Hash, int, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+
+			// onleaf 回调在 h.commitLoop() 中使用
 			h.commitLoop(t.db)
 		}()
 	}
 	newRoot, committed, err := h.Commit(t.root, t.db)
 	if onleaf != nil {
-		// The leafch is created in newCommitter if there was an onleaf callback
+		// The leafCh is created in newCommitter if there was an onleaf callback
 		// provided. The commitLoop only _reads_ from it, and the commit
 		// operation was the sole writer. Therefore, it's safe to close this
 		// channel here.
+
+		// 这里注释的意思是，leafCh 只在 h.Commit() 函数中被写入
+		// h.Commit() 是个同步函数，会递归调用 h.commit() 构建新树，并将节点写入 leafCh (这个过程不关心 onleaf 回调)
+		// 而代码运行到这里时，上方的 h.Commit() 已经执行完毕
+		// 所以，在这里可以安全的 close(h.leafCh)
+
 		close(h.leafCh)
 		wg.Wait()
 	}
 	if err != nil {
 		return common.Hash{}, 0, err
 	}
+
+	// 根据 h.Commit() 函数的返回类型，这里 newRoot 是 hashNode 类型
+	// 理解如下：此时原来 t.root 指向的树上，可能存在很多 nodeFlag.dirty 为 true 的节点
+	// 这里直接将 t.root 指向 newRoot 表示的 hashNode，表示忽略原有的树 (将被回收)
+	// 可以这么处理，是因为当前 Commit() 已经表示整个区块落盘了.
+	// 调用来源与 worker.resultLoop() -> BlockChain.WriteBlockAndSetHead()
 	t.root = newRoot
 	return rootHash, committed, nil
 }

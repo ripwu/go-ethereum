@@ -105,9 +105,17 @@ func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainCon
 
 	// Update the state with pending changes.
 	var root []byte
+
+	// 参考
+	// https://github.com/ethereum/EIPs/issues/98
+	// [Understanding Byzantium & What it Represents to the Ethereum Network](https://medium.com/digitalassetresearch/understanding-byzantium-what-it-represents-to-the-ethereum-network-9de3d00d552a)
+	// [What Is the Byzantium Hard Fork In Ethereum?](https://www.investopedia.com/news/what-byzantium-hard-fork-ethereum/)
+	// 不再通过 PostState 记录每笔交易执行后的中间 root hash，而是仅记录成功或失败 receipt.Status
+	// (TODO 理解：看文档，似乎是并发执行交易的需要，如果记录 PostState，则交易只能串行执行)
 	if config.IsByzantium(blockNumber) {
 		statedb.Finalise(true)
 	} else {
+		// 每执行完一笔交易，都会查询中间状态的 root hash，记录在收据 Receipt.PostState 中
 		root = statedb.IntermediateRoot(config.IsEIP158(blockNumber)).Bytes()
 	}
 	*usedGas += result.UsedGas
