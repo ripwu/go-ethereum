@@ -18,6 +18,8 @@ package trie
 
 import (
 	"bytes"
+	"fmt"
+	"github.com/ethereum/go-ethereum/common"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/rlp"
@@ -90,5 +92,85 @@ func TestDecodeFullNode(t *testing.T) {
 	_, err := decodeNode([]byte("testdecode"), buf.Bytes())
 	if err != nil {
 		t.Fatalf("decode full node err: %v", err)
+	}
+}
+
+//func TestEncodeNil(t *testing.T) {
+//	b := new(bytes.Buffer)
+//	var n node
+//	err := rlp.Encode(b, n)
+//	fmt.Println(b.Bytes())
+//	fmt.Println(err)
+//}
+
+func TestEncodeNilValueNode(t *testing.T) {
+	b := new(bytes.Buffer)
+	err := rlp.Encode(b, nilValueNode)
+	fmt.Println(b.Bytes())
+	fmt.Println(err)
+}
+
+func TestInsert1(t *testing.T) {
+	trie := newEmpty()
+
+	updateString(trie, "doe", "reindeerreindeerreindeerreindeerreindeerreindeerreindeerreindeerreindeerreindeerreindeer")
+
+	root := trie.Hash()
+	fmt.Printf("TestInsert1 root %x\n", root)
+
+	root, _, err := trie.Commit(nil)
+	if err != nil {
+		t.Fatalf("Trie.Commit error: %v", err)
+	}
+
+	trie.db.Commit(root, false, nil)
+	if err != nil {
+		t.Fatalf("Database.commit error: %v", err)
+	}
+}
+
+func TestInsert2(t *testing.T) {
+	trie := newEmpty()
+
+	updateString(trie, "doe", "reindeer")
+	updateString(trie, "dog", "puppy")
+
+	root := trie.Hash()
+	fmt.Printf("TestInsert3 root %x\n", root)
+
+	root, _, err := trie.Commit(nil)
+	if err != nil {
+		t.Fatalf("Trie.Commit error: %v", err)
+	}
+
+	trie.db.Commit(root, false, nil)
+	if err != nil {
+		t.Fatalf("Database.commit error: %v", err)
+	}
+}
+
+func TestInsert3(t *testing.T) {
+	trie := newEmpty()
+
+	updateString(trie, "doe", "reindeer")
+	updateString(trie, "dog", "puppy")
+	updateString(trie, "dogglesworth", "cat")
+
+	exp := common.HexToHash("8aad789dff2f538bca5d8ea56e8abe10f4c7ba3a5dea95fea4cd6e7c3a1168d3")
+	root := trie.Hash()
+	if root != exp {
+		t.Errorf("case 1: exp %x got %x", exp, root)
+	}
+
+	trie = newEmpty()
+	updateString(trie, "A", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+	exp = common.HexToHash("d23786fb4a010da3ce639d66d5e904a11dbc02746d1ce25029e53290cabf28ab")
+	root, _, err := trie.Commit(nil)
+	if err != nil {
+		t.Fatalf("commit error: %v", err)
+	}
+	if root != exp {
+		t.Errorf("case 2: exp %x got %x", exp, root)
 	}
 }

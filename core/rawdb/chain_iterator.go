@@ -177,6 +177,7 @@ func iterateTransactions(db ethdb.Database, from uint64, to uint64, reverse bool
 //
 // There is a passed channel, the whole procedure will be interrupted if any
 // signal received.
+// 写入 txloopup 作为索引，可以处理 GetTransactionReceipt() 之类按 txHash 查询的请求
 func indexTransactions(db ethdb.Database, from uint64, to uint64, interrupt chan struct{}, hook func(uint64) bool) {
 	// short circuit for invalid range
 	if from >= to {
@@ -212,6 +213,8 @@ func indexTransactions(db ethdb.Database, from uint64, to uint64, interrupt chan
 			// Next block available, pop it off and index it
 			delivery := queue.PopItem().(*blockTxHashes)
 			lastNum = delivery.number
+
+			// 写入 txlookup 数据
 			WriteTxLookupEntries(batch, delivery.number, delivery.hashes)
 			blocks++
 			txs += len(delivery.hashes)

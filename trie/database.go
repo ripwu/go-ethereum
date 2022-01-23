@@ -70,6 +70,8 @@ type Database struct {
 	diskdb ethdb.KeyValueStore // Persistent storage for matured trie nodes
 
 	cleans  *fastcache.Cache            // GC friendly memory cache of clean node RLPs
+
+	// 存的是坍缩过的 cachedNode
 	dirties map[common.Hash]*cachedNode // Data and references relationships of dirty trie nodes
 	oldest  common.Hash                 // Oldest tracked node, flush-list head
 	newest  common.Hash                 // Newest tracked node, flush-list tail
@@ -88,6 +90,7 @@ type Database struct {
 	childrenSize  common.StorageSize // Storage size of the external children tracking
 	preimagesSize common.StorageSize // Storage size of the preimages cache
 
+	// 对 dirties 的并发访问
 	lock sync.RWMutex
 }
 
@@ -142,7 +145,12 @@ type cachedNode struct {
 	node node   // Cached collapsed trie node, or raw rlp data
 	size uint16 // Byte size of the useful cached data
 
+	// 统计 引用 和 被引用 信息，用于垃圾回收
+
+	// 当前节点被几个活着的父节点引用 (被引用时 +1，解引用时 -1；为 0 则说明无人引用当前节点，可以回收)
 	parents  uint32                 // Number of live nodes referencing this one
+
+	// 当前节点对各子节点的引用次数
 	children map[common.Hash]uint16 // External children referenced by this node
 
 	flushPrev common.Hash // Previous node in the flush-list
@@ -184,6 +192,7 @@ func (n *cachedNode) obj(hash common.Hash) node {
 // both the implicit ones from inside the node as well as the explicit ones
 // from outside the node.
 func (n *cachedNode) forChilds(onChild func(hash common.Hash)) {
+	// children 感觉是配合 snapshot 使用的，由 Reference() 函数设置
 	for child := range n.children {
 		onChild(child)
 	}
@@ -196,13 +205,14 @@ func (n *cachedNode) forChilds(onChild func(hash common.Hash)) {
 // invokes the callback for all the hashnode children.
 func forGatherChildren(n node, onChild func(hash common.Hash)) {
 	switch n := n.(type) {
-	case *rawShortNode:
+	case *rawShortNode: // 扩展节点
 		forGatherChildren(n.Val, onChild)
-	case rawFullNode:
+	case rawFullNode: // 分支节点
 		for i := 0; i < 16; i++ {
 			forGatherChildren(n[i], onChild)
 		}
-	case hashNode:
+	case hashNode: // hashNode
+		// 从上面对 rawShortNode 和 rawFullNode 的处理可以看出，只有指向节点 (.Val) 为 hashNode 节点才会实际调用 onChild
 		onChild(common.BytesToHash(n))
 	case valueNode, nil, rawNode:
 	default:
@@ -211,7 +221,11 @@ func forGatherChildren(n node, onChild func(hash common.Hash)) {
 }
 
 // simplifyNode traverses the hierarchy of an expanded memory node and discards
-// all the internal caches, returning a node that only contains the raw data.
+// all the internal caches (nodeFlag{cache, dirty}), returning a node that only contains the raw data.
+// shortNode => rawShortNode
+// fullNode => rawFullNode
+// valueNode => valueNode
+// hashNode => hashNode
 func simplifyNode(n node) node {
 	switch n := n.(type) {
 	case *shortNode:
@@ -220,7 +234,10 @@ func simplifyNode(n node) node {
 
 	case *fullNode:
 		// Full nodes discard the flags and cascade
+
+		// n.Children 是 [17]node 类型，这里是复制转成 rawFullNode 类型的意思
 		node := rawFullNode(n.Children)
+
 		for i := 0; i < len(node); i++ {
 			if node[i] != nil {
 				node[i] = simplifyNode(node[i])
@@ -289,6 +306,13 @@ func NewDatabase(diskdb ethdb.KeyValueStore) *Database {
 // NewDatabaseWithConfig creates a new trie database to store ephemeral trie content
 // before its written out to disk or garbage collected. It also acts as a read cache
 // for nodes loaded from disk.
+
+// 初始化流程
+// Node.OpenDatabaseWithFreezer() -> rawdb.NewLevelDBDatabaseWithFreezer() -> Node.wrapDatabase() // node/node.go
+//   => func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, ...) (*BlockChain, error) // core/blockchain.go
+//     => stateCache: state.NewDatabaseWithConfig(db, ...) // core/state/database.go
+//       => trie.NewDatabaseWithConfig(db, config) // trie/database.go
+
 func NewDatabaseWithConfig(diskdb ethdb.KeyValueStore, config *Config) *Database {
 	var cleans *fastcache.Cache
 	if config != nil && config.Cache > 0 {
@@ -301,6 +325,12 @@ func NewDatabaseWithConfig(diskdb ethdb.KeyValueStore, config *Config) *Database
 	db := &Database{
 		diskdb: diskdb,
 		cleans: cleans,
+
+		// XXX 注意这里：初始化时插入 common.Hash{} 作为 key
+		// TODO 具体用途
+		// BlackChain.writeBlockWithState() 会调用 triedb.Reference(root, common.Hash{}) 使用 emptyHash 引用 最新区块对应的根节点，
+		// emptyHash 的 children 会记录每个区块的哈希。BlackChain.writeBlockWithState() 同时还会调用 triedb.Dereference(root.(common.Hash))
+		// 解引用 HEAD-128 区块的根哈希，此时 emptyHash 的 children 中 HEAD-128 的引用将为 0，导致它从 emptyHash 的 children 中删除
 		dirties: map[common.Hash]*cachedNode{{}: {
 			children: make(map[common.Hash]uint16),
 		}},
@@ -320,8 +350,11 @@ func (db *Database) DiskDB() ethdb.KeyValueStore {
 // The blob size must be specified to allow proper size tracking.
 // All nodes inserted by this function will be reference tracked
 // and in theory should only used for **trie nodes** insertion.
+// 插入坍缩后的 node，它将由引用计数控制；调用时，node 的 Key 已经 Compact 的
 func (db *Database) insert(hash common.Hash, size int, node node) {
 	// If the node's already cached, skip
+	// XXX 注意这里：如果 hash 已经存在，可以直接 skip
+	// 理解：因为 hash 是 Key + Val 的哈希值，所以 dirties 中已存在的 node，一定与参数 node 相同，所以不需要用参数 node 覆盖
 	if _, ok := db.dirties[hash]; ok {
 		return
 	}
@@ -329,10 +362,17 @@ func (db *Database) insert(hash common.Hash, size int, node node) {
 
 	// Create the cached entry for this node
 	entry := &cachedNode{
+		// 注意这里只保留数据，删除 nodeFlags
+		// shortNode => rawShortNode
+		// fullNode => rawFullNode
+		// valueNode => valueNode
+		// hashNode => hashNode
 		node:      simplifyNode(node),
 		size:      uint16(size),
 		flushPrev: db.newest,
 	}
+
+	// 对于 entry 下 hashNode 类型的子节点，调用回调，记录多少父节点引用这个 hashNode 子节点
 	entry.forChilds(func(child common.Hash) {
 		if c := db.dirties[child]; c != nil {
 			c.parents++
@@ -367,8 +407,10 @@ func (db *Database) insertPreimage(hash common.Hash, preimage []byte) {
 	db.preimagesSize += common.StorageSize(common.HashLength + len(preimage))
 }
 
-// node retrieves a cached trie node from memory, or returns nil if none can be
-// found in the memory cache.
+// node retrieves a cached trie node from memory. If it cannot be found
+// cached, the method queries the persistent database for the content.
+// 返回：RLP 编码前的值
+// 根据 hash 在缓存中查找节点，不存在的话从 db 加载并反序列化后展开
 func (db *Database) node(hash common.Hash) node {
 	// Retrieve the node from the clean cache if available
 	if db.cleans != nil {
@@ -400,11 +442,15 @@ func (db *Database) node(hash common.Hash) node {
 		memcacheCleanMissMeter.Mark(1)
 		memcacheCleanWriteMeter.Mark(int64(len(enc)))
 	}
+
+	// 反序列化节点
 	return mustDecodeNode(hash[:], enc)
 }
 
 // Node retrieves an encoded cached trie node from memory. If it cannot be found
 // cached, the method queries the persistent database for the content.
+// 返回：RLP 编码后的值
+// 根据 hash 读出 value
 func (db *Database) Node(hash common.Hash) ([]byte, error) {
 	// It doesn't make sense to retrieve the metaroot
 	if hash == (common.Hash{}) {
@@ -491,19 +537,30 @@ func (db *Database) Reference(child common.Hash, parent common.Hash) {
 // reference is the private locked version of Reference.
 func (db *Database) reference(child common.Hash, parent common.Hash) {
 	// If the node does not exist, it's a node pulled from disk, skip
+	// 如果 child 不存在 dirties 中，说明这个节点此前已经入库，而非新建节点，可以直接返回
 	node, ok := db.dirties[child]
 	if !ok {
 		return
 	}
+
+	// XXX 注意这里：
+	// 多个协程可能引用同一根节点 (如 RPC API，此时 parent 为空哈希，child 为某个区块的根哈希），因此需要判断 parent：
+	// 如果为空哈希，说明 child 为根节点，此时需要支持重复计数，否则，一旦一个协程退出，解引用将导致根节点被回收；新来的请求将无法处理 (找不到旧区块)
+	// 如果不为空哈希，说明 child 是中间节点，不允许同一 parent 对同一 child 重复计数
+
 	// If the reference already exists, only duplicate for roots
 	if db.dirties[parent].children == nil {
 		db.dirties[parent].children = make(map[common.Hash]uint16)
 		db.childrenSize += cachedNodeChildrenSize
 	} else if _, ok = db.dirties[parent].children[child]; ok && parent != (common.Hash{}) {
+		// parent != (common.Hash{}) 说明不是根节点，而是中间节点
+		// 不允许同一 parent 对同一 child 重复计数，直接返回
 		return
 	}
+
 	node.parents++
 	db.dirties[parent].children[child]++
+
 	if db.dirties[parent].children[child] == 1 {
 		db.childrenSize += common.HashLength + 2 // uint16 counter
 	}
@@ -520,6 +577,8 @@ func (db *Database) Dereference(root common.Hash) {
 	defer db.lock.Unlock()
 
 	nodes, storage, start := len(db.dirties), db.dirtiesSize, time.Now()
+
+	// 注意参数 parent 传的是 emptyHash
 	db.dereference(root, common.Hash{})
 
 	db.gcnodes += uint64(nodes - len(db.dirties))
@@ -536,6 +595,7 @@ func (db *Database) Dereference(root common.Hash) {
 
 // dereference is the private locked version of Dereference.
 func (db *Database) dereference(child common.Hash, parent common.Hash) {
+	// 1.处理 parent 节点的引用
 	// Dereference the parent-child
 	node := db.dirties[parent]
 
@@ -546,11 +606,14 @@ func (db *Database) dereference(child common.Hash, parent common.Hash) {
 			db.childrenSize -= (common.HashLength + 2) // uint16 counter
 		}
 	}
+
+	// 2.处理 child 节点的引用
 	// If the child does not exist, it's a previously committed node.
 	node, ok := db.dirties[child]
 	if !ok {
 		return
 	}
+
 	// If there are no more references to the child, delete it and cascade
 	if node.parents > 0 {
 		// This is a special cornercase where a node loaded from disk (i.e. not in the
@@ -559,7 +622,9 @@ func (db *Database) dereference(child common.Hash, parent common.Hash) {
 		// no problem in itself, but don't make maxint parents out of it.
 		node.parents--
 	}
+
 	if node.parents == 0 {
+		// 1.先将当前节点从 flush 列表中删除
 		// Remove the node from the flush-list
 		switch child {
 		case db.oldest:
@@ -572,11 +637,27 @@ func (db *Database) dereference(child common.Hash, parent common.Hash) {
 			db.dirties[node.flushPrev].flushNext = node.flushNext
 			db.dirties[node.flushNext].flushPrev = node.flushPrev
 		}
+
+		// XXX 注意这里：对递归解引用的理解
+		// 问题：从 Reference() 可以看到，reference() 时是没有递归建立引用的，
+		// 那么，这里递归解开的引用，是什么时候创建的？
+		// 理解：结合 StateDB.Commit() 代码理解，它调用 Trie.Commit()，递归提交节点，经过
+		// Committer.commitLoop() 进一步回调 onleaf；在回调中，对扩展节点和分支节点中的
+		// StateAccount 账户数据进行了引用。因此，这里需要递归解引用
+
+		// 2.再递归解除当前节点对子节点的引用
 		// Dereference all children and delete the node
 		node.forChilds(func(hash common.Hash) {
 			db.dereference(hash, child)
 		})
+
+		// XXX 注意这里：引用和解引用最重要的目的
+		// 如果 child 没有被节点引用，说明当前节点已经过期，可以直接从 dirties 中删除，
+		// 这样调用 Database.Commit() 时不会写入，即所谓的垃圾回收
+
+		// 3.最后从 dirties 中删除当前节点
 		delete(db.dirties, child)
+
 		db.dirtiesSize -= common.StorageSize(common.HashLength + int(node.size))
 		if node.children != nil {
 			db.childrenSize -= cachedNodeChildrenSize
@@ -692,6 +773,9 @@ func (db *Database) Cap(limit common.StorageSize) error {
 //
 // Note, this method is a non-synchronized mutator. It is unsafe to call this
 // concurrently with other mutators.
+// 调用来源
+// BlockChain.writeBlockWithState()：仅在 bc.cacheConfig.TrieDirtyDisabled 手动打开配置时才调用，正常不会进来
+// BlockChain.Stop()：geth exit 触发
 func (db *Database) Commit(node common.Hash, report bool, callback func(common.Hash)) error {
 	// Create a database batch to flush persistent data out. It is important that
 	// outside code doesn't see an inconsistent state (referenced data removed from
@@ -710,6 +794,7 @@ func (db *Database) Commit(node common.Hash, report bool, callback func(common.H
 		}
 		batch.Reset()
 	}
+
 	// Move the trie itself into the batch, flushing if enough data is accumulated
 	nodes, storage := len(db.dirties), db.dirtiesSize
 
@@ -718,7 +803,9 @@ func (db *Database) Commit(node common.Hash, report bool, callback func(common.H
 		log.Error("Failed to commit trie from trie database", "err", err)
 		return err
 	}
+
 	// Trie mostly committed to disk, flush any batch leftovers
+	// batch.Write() 向 db 批量写入
 	if err := batch.Write(); err != nil {
 		log.Error("Failed to write trie to disk", "err", err)
 		return err
@@ -760,6 +847,10 @@ func (db *Database) commit(hash common.Hash, batch ethdb.Batch, uncacher *cleane
 		return nil
 	}
 	var err error
+
+	// 这里 Commit -> forChilds() 和 TryUpdate -> insert() 两步结合起来，比较好理解：
+	// 更新数据时：insert() 自下而上递归调用，先将子节点写入了 db.dirties，再写当前节点
+	// 提交数据时：forChilds() 也是自下而上递归调用，先判断 db.dirties 是否包括子节点，是的话先提交子节点，再提交当前节点
 	node.forChilds(func(child common.Hash) {
 		if err == nil {
 			err = db.commit(child, batch, uncacher, callback)
@@ -768,11 +859,15 @@ func (db *Database) commit(hash common.Hash, batch ethdb.Batch, uncacher *cleane
 	if err != nil {
 		return err
 	}
+
 	// If we've reached an optimal batch size, commit and start over
+	// 从这里可以看到，写入 db 时，key 为 hash，node 为 RLP 后的编码（分 Key 和 Val 两部分，参考 Database.insert()）
 	rawdb.WriteTrieNode(batch, hash, node.rlp())
+
 	if callback != nil {
 		callback(hash)
 	}
+
 	if batch.ValueSize() >= ethdb.IdealBatchSize {
 		if err := batch.Write(); err != nil {
 			return err
@@ -816,17 +911,24 @@ func (c *cleaner) Put(key []byte, rlp []byte) error {
 		c.db.dirties[node.flushPrev].flushNext = node.flushNext
 		c.db.dirties[node.flushNext].flushPrev = node.flushPrev
 	}
+
+	// 这里不用管 hash 的引用关系，因为调用来源一定是整个 Database.Commit()，所有 dirties 都会被写到硬盘，因此可以直接删除
+	// 对应了 Commit() 注释中的 forcefully tearing down all references in both directions 的意思
+
 	// Remove the node from the dirty cache
 	delete(c.db.dirties, hash)
+
 	c.db.dirtiesSize -= common.StorageSize(common.HashLength + int(node.size))
 	if node.children != nil {
 		c.db.dirtiesSize -= common.StorageSize(cachedNodeChildrenSize + len(node.children)*(common.HashLength+2))
 	}
+
 	// Move the flushed node into the clean cache to prevent insta-reloads
 	if c.db.cleans != nil {
 		c.db.cleans.Set(hash[:], rlp)
 		memcacheCleanWriteMeter.Mark(int64(len(rlp)))
 	}
+
 	return nil
 }
 

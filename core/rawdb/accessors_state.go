@@ -77,6 +77,8 @@ func WriteCode(db ethdb.KeyValueWriter, hash common.Hash, code []byte) {
 }
 
 // DeleteCode deletes the specified contract code from the database.
+// 没找到有实际代码调用的地方，看起来是不会删的...
+// 理解：两个合约可以有相同的代码，他们的 codeHash 相同，因此指向数据库同一个 item，因此不能删除
 func DeleteCode(db ethdb.KeyValueWriter, hash common.Hash) {
 	if err := db.Delete(codeKey(hash)); err != nil {
 		log.Crit("Failed to delete contract code", "err", err)
@@ -103,6 +105,7 @@ func WriteTrieNode(db ethdb.KeyValueWriter, hash common.Hash, node []byte) {
 }
 
 // DeleteTrieNode deletes the specified trie node from the database.
+// 实际不会被调用
 func DeleteTrieNode(db ethdb.KeyValueWriter, hash common.Hash) {
 	if err := db.Delete(hash.Bytes()); err != nil {
 		log.Crit("Failed to delete trie node", "err", err)

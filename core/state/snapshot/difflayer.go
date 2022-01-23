@@ -32,6 +32,8 @@ import (
 )
 
 var (
+	// TODO 参考 Dynamic state snapshots #20152 中 holiman 的估算
+
 	// aggregatorMemoryLimit is the maximum size of the bottom-most diff layer
 	// that aggregates the writes from above until it's flushed into the disk
 	// layer.
@@ -42,7 +44,7 @@ var (
 	aggregatorMemoryLimit = uint64(4 * 1024 * 1024)
 
 	// aggregatorItemLimit is an approximate number of items that will end up
-	// in the agregator layer before it's flushed out to disk. A plain account
+	// in the aggregator layer before it's flushed out to disk. A plain account
 	// weighs around 14B (+hash), a storage slot 32B (+hash), a deleted slot
 	// 0B (+hash). Slots are mostly set/unset in lockstep, so that average at
 	// 16B (+hash). All in all, the average entry seems to be 15+32=47B. Use a
@@ -97,12 +99,19 @@ func init() {
 //
 // The goal of a diff layer is to act as a journal, tracking recent modifications
 // made to the state, that have not yet graduated into a semi-immutable state.
+// diffLayer 记录对应 block 执行时产生的修改
 type diffLayer struct {
+	// 指向底层 diskLayer
 	origin *diskLayer // Base disk layer to directly use on bloom misses
+
+	// 指向父层，可能是 diskLayer 或 diffLayer
 	parent snapshot   // Parent snapshot modified by this one, never nil
+
 	memory uint64     // Approximate guess as to how much memory we use
 
 	root  common.Hash // Root hash to which this snapshot diff belongs to
+
+	// 正常来说，在 diffToDisk() 中被设置为 true，表示 diffLayer 数据已经写入 diskLayer
 	stale uint32      // Signals that the layer became stale (state progressed)
 
 	// destructSet is a very special helper marker. If an account is marked as
@@ -118,8 +127,13 @@ type diffLayer struct {
 	storageList map[common.Hash][]common.Hash          // List of storage slots for iterated retrievals, one per account. Any existing lists are sorted if non-nil
 	storageData map[common.Hash]map[common.Hash][]byte // Keyed storage slots for direct retrieval. one per account (nil means deleted)
 
+	// 理解：维护从 diskLayer 经过中间的 diffLayer 到当前 diffLayer，累计的 bloom filter
+	// 用于快速过滤 account 是否出现在中间层 diffLayer 中，加快查询请求 (参考 diffLayer.AccountRLP(hash common.Hash))
+	// 如果存在，查询时递归不过向上层 diffLayer 查询 账户 (参考 diffLayer.accountRLP(hash common.Hash, depth int))
+	// 如果不存在，直接请求底层 diskLayer，从 db 中查询
 	diffed *bloomfilter.Filter // Bloom filter tracking all the diffed items up to the disk layer
 
+	// 粒度：看起来是为了控制整个结构体的并发访问，不限定某些成员
 	lock sync.RWMutex
 }
 
@@ -168,6 +182,7 @@ func (h storageBloomHasher) Sum64() uint64 {
 
 // newDiffLayer creates a new diff on top of an existing snapshot, whether that's a low
 // level persistent database or a hierarchical diff already.
+// parent 可能是 diskLayer 也可能是 diffLayer
 func newDiffLayer(parent snapshot, root common.Hash, destructs map[common.Hash]struct{}, accounts map[common.Hash][]byte, storage map[common.Hash]map[common.Hash][]byte) *diffLayer {
 	// Create the new layer with some pre-allocated data segments
 	dl := &diffLayer{
@@ -178,6 +193,7 @@ func newDiffLayer(parent snapshot, root common.Hash, destructs map[common.Hash]s
 		storageData: storage,
 		storageList: make(map[common.Hash][]common.Hash),
 	}
+
 	switch parent := parent.(type) {
 	case *diskLayer:
 		dl.rebloom(parent)
@@ -186,6 +202,8 @@ func newDiffLayer(parent snapshot, root common.Hash, destructs map[common.Hash]s
 	default:
 		panic("unknown parent type")
 	}
+
+	// 对传入参数的完整性检查
 	// Sanity check that accounts or storage slots are never nil
 	for accountHash, blob := range accounts {
 		if blob == nil {
@@ -195,6 +213,7 @@ func newDiffLayer(parent snapshot, root common.Hash, destructs map[common.Hash]s
 		dl.memory += uint64(common.HashLength + len(blob))
 		snapshotDirtyAccountWriteMeter.Mark(int64(len(blob)))
 	}
+
 	for accountHash, slots := range storage {
 		if slots == nil {
 			panic(fmt.Sprintf("storage %#x nil", accountHash))
@@ -205,12 +224,14 @@ func newDiffLayer(parent snapshot, root common.Hash, destructs map[common.Hash]s
 			snapshotDirtyStorageWriteMeter.Mark(int64(len(data)))
 		}
 	}
+
 	dl.memory += uint64(len(destructs) * common.HashLength)
 	return dl
 }
 
 // rebloom discards the layer's current bloom and rebuilds it from scratch based
 // on the parent's and the local diffs.
+// 重新构建本层的 diffed 累计过滤器：将 父层过滤器 与 本层修改内容，合并写到 本层过滤器
 func (dl *diffLayer) rebloom(origin *diskLayer) {
 	dl.lock.Lock()
 	defer dl.lock.Unlock()
@@ -223,25 +244,35 @@ func (dl *diffLayer) rebloom(origin *diskLayer) {
 	dl.origin = origin
 
 	// Retrieve the parent bloom or create a fresh empty one
+	// 重新初始化本层 diffed 或拷贝上层 diffed
 	if parent, ok := dl.parent.(*diffLayer); ok {
 		parent.lock.RLock()
+
+		// 1.尝试拷贝父层的 diffed
 		dl.diffed, _ = parent.diffed.Copy()
+
 		parent.lock.RUnlock()
 	} else {
 		dl.diffed, _ = bloomfilter.New(uint64(bloomSize), uint64(bloomFuncs))
 	}
+
+	// 2.然后向本层 diffed 写入本层的数据
+
 	// Iterate over all the accounts and storage slots and index them
 	for hash := range dl.destructSet {
 		dl.diffed.Add(destructBloomHasher(hash))
 	}
+
 	for hash := range dl.accountData {
 		dl.diffed.Add(accountBloomHasher(hash))
 	}
+
 	for accountHash, slots := range dl.storageData {
 		for storageHash := range slots {
 			dl.diffed.Add(storageBloomHasher{accountHash, storageHash})
 		}
 	}
+
 	// Calculate the current false positive rate and update the error rate meter.
 	// This is a bit cheating because subsequent layers will overwrite it, but it
 	// should be fine, we're only interested in ballpark figures.
@@ -274,9 +305,11 @@ func (dl *diffLayer) Account(hash common.Hash) (*Account, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if len(data) == 0 { // can be both nil and []byte{}
 		return nil, nil
 	}
+
 	account := new(Account)
 	if err := rlp.DecodeBytes(data, account); err != nil {
 		panic(err)
@@ -292,14 +325,17 @@ func (dl *diffLayer) AccountRLP(hash common.Hash) ([]byte, error) {
 	// Check the bloom filter first whether there's even a point in reaching into
 	// all the maps in all the layers below
 	dl.lock.RLock()
+
 	hit := dl.diffed.Contains(accountBloomHasher(hash))
 	if !hit {
 		hit = dl.diffed.Contains(destructBloomHasher(hash))
 	}
+
 	var origin *diskLayer
 	if !hit {
 		origin = dl.origin // extract origin while holding the lock
 	}
+
 	dl.lock.RUnlock()
 
 	// If the bloom filter misses, don't even bother with traversing the memory
@@ -308,6 +344,7 @@ func (dl *diffLayer) AccountRLP(hash common.Hash) ([]byte, error) {
 		snapshotBloomAccountMissMeter.Mark(1)
 		return origin.AccountRLP(hash)
 	}
+
 	// The bloom filter hit, start poking in the internal maps
 	return dl.accountRLP(hash, 0)
 }
@@ -324,6 +361,7 @@ func (dl *diffLayer) accountRLP(hash common.Hash, depth int) ([]byte, error) {
 	if dl.Stale() {
 		return nil, ErrSnapshotStale
 	}
+
 	// If the account is known locally, return it
 	if data, ok := dl.accountData[hash]; ok {
 		snapshotDirtyAccountHitMeter.Mark(1)
@@ -332,6 +370,7 @@ func (dl *diffLayer) accountRLP(hash common.Hash, depth int) ([]byte, error) {
 		snapshotBloomAccountTrueHitMeter.Mark(1)
 		return data, nil
 	}
+
 	// If the account is known locally, but deleted, return it
 	if _, ok := dl.destructSet[hash]; ok {
 		snapshotDirtyAccountHitMeter.Mark(1)
@@ -340,10 +379,12 @@ func (dl *diffLayer) accountRLP(hash common.Hash, depth int) ([]byte, error) {
 		snapshotBloomAccountTrueHitMeter.Mark(1)
 		return nil, nil
 	}
+
 	// Account unknown to this diff, resolve from parent
 	if diff, ok := dl.parent.(*diffLayer); ok {
 		return diff.accountRLP(hash, depth+1)
 	}
+
 	// Failed to resolve through diff layers, mark a bloom error and use the disk
 	snapshotBloomAccountFalseHitMeter.Mark(1)
 	return dl.parent.AccountRLP(hash)
@@ -381,6 +422,7 @@ func (dl *diffLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 // storage is an internal version of Storage that skips the bloom filter checks
 // and uses the internal maps to try and retrieve the data. It's meant  to be
 // used if a higher layer's bloom filter hit already.
+// 注释中的 higher layer，是更高的 block Number 的意思，即当前 diffLayer 的子层
 func (dl *diffLayer) storage(accountHash, storageHash common.Hash, depth int) ([]byte, error) {
 	dl.lock.RLock()
 	defer dl.lock.RUnlock()
@@ -390,6 +432,7 @@ func (dl *diffLayer) storage(accountHash, storageHash common.Hash, depth int) ([
 	if dl.Stale() {
 		return nil, ErrSnapshotStale
 	}
+
 	// If the account is known locally, try to resolve the slot locally
 	if storage, ok := dl.storageData[accountHash]; ok {
 		if data, ok := storage[storageHash]; ok {
@@ -404,6 +447,7 @@ func (dl *diffLayer) storage(accountHash, storageHash common.Hash, depth int) ([
 			return data, nil
 		}
 	}
+
 	// If the account is known locally, but deleted, return an empty slot
 	if _, ok := dl.destructSet[accountHash]; ok {
 		snapshotDirtyStorageHitMeter.Mark(1)
@@ -412,10 +456,12 @@ func (dl *diffLayer) storage(accountHash, storageHash common.Hash, depth int) ([
 		snapshotBloomStorageTrueHitMeter.Mark(1)
 		return nil, nil
 	}
+
 	// Storage slot unknown to this diff, resolve from parent
 	if diff, ok := dl.parent.(*diffLayer); ok {
 		return diff.storage(accountHash, storageHash, depth+1)
 	}
+
 	// Failed to resolve through diff layers, mark a bloom error and use the disk
 	snapshotBloomStorageFalseHitMeter.Mark(1)
 	return dl.parent.Storage(accountHash, storageHash)
@@ -430,15 +476,33 @@ func (dl *diffLayer) Update(blockRoot common.Hash, destructs map[common.Hash]str
 // flatten pushes all data from this point downwards, flattening everything into
 // a single diff at the bottom. Since usually the lowermost diff is the largest,
 // the flattening builds up from there in reverse.
+// 调用来源：Tree.Cap() / Tree.cap()
+//
+// 递归合并多层 diffLayer，最终得到一层 diffLayer
+// 1.将 diffLayer1 合并到 diffLayer0，得到 diffLayerNew0
+// 2.将 diffLayer2 合并到 diffLayerNew0，得到 diffLayerNew1
+// 3.将 diffLayer3 合并到 diffLayerNew1，得到 diffLayerNew2
+// ...
+// 最后，返回 将 dl 表示的 diffLayer 合并到 diffLayerNewX，得到 diffLayerNewY 并返回
+//
+// 可以有两种合并顺序：
+// (((dl0 <- dl1) <- dl2) <- ... <-dlN)
+// (dl0 <- (dl1 <- (dl2 <- ... (dlN-2 <- (dlN-1 <- dlN)))))
+// TODO 理解：代码采用的是第一种顺序。按照注释，是为了减少合并的数据量
 func (dl *diffLayer) flatten() snapshot {
 	// If the parent is not diff, we're the first in line, return unmodified
+	// 如果 parent 不是 diffLayer，直接返回当前层
+	// (说明：parent 是 diskLayer，即当前层已经是最早的 diffLayer)
 	parent, ok := dl.parent.(*diffLayer)
 	if !ok {
 		return dl
 	}
+
 	// Parent is a diff, flatten it first (note, apart from weird corned cases,
 	// flatten will realistically only ever merge 1 layer, so there's no need to
 	// be smarter about grouping flattens together).
+
+	// flatten() 返回的是新构造的 diffLayer，这里将其转为 parent，再将当前节点合并，递归调用
 	parent = parent.flatten().(*diffLayer)
 
 	parent.lock.Lock()
@@ -449,37 +513,47 @@ func (dl *diffLayer) flatten() snapshot {
 	if atomic.SwapUint32(&parent.stale, 1) != 0 {
 		panic("parent diff layer is stale") // we've flattened into the same parent from two children, boo
 	}
+
 	// Overwrite all the updated accounts blindly, merge the sorted list
 	for hash := range dl.destructSet {
 		parent.destructSet[hash] = struct{}{}
 		delete(parent.accountData, hash)
 		delete(parent.storageData, hash)
 	}
+
 	for hash, data := range dl.accountData {
 		parent.accountData[hash] = data
 	}
+
 	// Overwrite all the updated storage slots (individually)
 	for accountHash, storage := range dl.storageData {
+		// 父层不存在则直接引用
 		// If storage didn't exist (or was deleted) in the parent, overwrite blindly
 		if _, ok := parent.storageData[accountHash]; !ok {
 			parent.storageData[accountHash] = storage
 			continue
 		}
+
+		// 两层都存在，则合并到父层
 		// Storage exists in both parent and child, merge the slots
 		comboData := parent.storageData[accountHash]
 		for storageHash, data := range storage {
 			comboData[storageHash] = data
 		}
+
 		parent.storageData[accountHash] = comboData
 	}
+
 	// Return the combo parent
+	// 通过上面的操作，dl 数据已被合并到 parent，即两层合一
+	// 这里返回合并后，形成的新的 diffLayer，作为被递归调用的父节点..
 	return &diffLayer{
-		parent:      parent.parent,
+		parent:      parent.parent, // 指向 祖父节点
 		origin:      parent.origin,
 		root:        dl.root,
-		destructSet: parent.destructSet,
-		accountData: parent.accountData,
-		storageData: parent.storageData,
+		destructSet: parent.destructSet, // 当前层的数据已写入 parent
+		accountData: parent.accountData, // 当前层的数据已写入 parent
+		storageData: parent.storageData, // 当前层的数据已写入 parent
 		storageList: make(map[common.Hash][]common.Hash),
 		diffed:      dl.diffed,
 		memory:      parent.memory + dl.memory,
@@ -499,19 +573,23 @@ func (dl *diffLayer) AccountList() []common.Hash {
 	if list != nil {
 		return list
 	}
+
 	// No old sorted account list exists, generate a new one
 	dl.lock.Lock()
 	defer dl.lock.Unlock()
 
+	// 重新构造 dl.accountList
 	dl.accountList = make([]common.Hash, 0, len(dl.destructSet)+len(dl.accountData))
 	for hash := range dl.accountData {
 		dl.accountList = append(dl.accountList, hash)
 	}
+
 	for hash := range dl.destructSet {
 		if _, ok := dl.accountData[hash]; !ok {
 			dl.accountList = append(dl.accountList, hash)
 		}
 	}
+
 	sort.Sort(hashes(dl.accountList))
 	dl.memory += uint64(len(dl.accountList) * common.HashLength)
 	return dl.accountList
@@ -526,6 +604,7 @@ func (dl *diffLayer) AccountList() []common.Hash {
 // not empty but the flag is true.
 //
 // Note, the returned slice is not a copy, so do not modify it.
+// @return bool Storage Trie 整颗树是否 *曾经* 被删除 (删除后重建将返回 true)
 func (dl *diffLayer) StorageList(accountHash common.Hash) ([]common.Hash, bool) {
 	dl.lock.RLock()
 	_, destructed := dl.destructSet[accountHash]
@@ -534,24 +613,29 @@ func (dl *diffLayer) StorageList(accountHash common.Hash) ([]common.Hash, bool) 
 		dl.lock.RUnlock()
 		return nil, destructed
 	}
+
 	// If an old list already exists, return it
 	if list, exist := dl.storageList[accountHash]; exist {
 		dl.lock.RUnlock()
 		return list, destructed // the cached list can't be nil
 	}
+
 	dl.lock.RUnlock()
 
 	// No old sorted account list exists, generate a new one
 	dl.lock.Lock()
 	defer dl.lock.Unlock()
 
+	// 重新构造 dl.storageList[accountHash]
 	storageMap := dl.storageData[accountHash]
 	storageList := make([]common.Hash, 0, len(storageMap))
 	for k := range storageMap {
 		storageList = append(storageList, k)
 	}
+
 	sort.Sort(hashes(storageList))
 	dl.storageList[accountHash] = storageList
+
 	dl.memory += uint64(len(dl.storageList)*common.HashLength + common.HashLength)
 	return storageList, destructed
 }

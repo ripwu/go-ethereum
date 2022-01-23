@@ -34,19 +34,34 @@ package trie
 // in the case of an odd number. All remaining nibbles (now an even number) fit properly
 // into the remaining bytes. Compact encoding is used for nodes stored on disk.
 
+// 三种编码方式
+// KEYBYTES 原生 [32]byte
+// HEX 按 16 进制编码 (如果当前 key 有值，则结尾追加 terminator)
+// COMPACT/HP 用于持久存储。Compact 的实际意思是两两字节又被作为半字节被编码为一字节，因此是压紧了 (忽略为了区分 terminator/odd 而引入的前半字节/一字节)
+
 func hexToCompact(hex []byte) []byte {
 	terminator := byte(0)
+
+	// 以 \16 结尾，说明当前节点是叶子节点
+	// 结尾来源：在 Trie.TryUpdate() 中会统一对 Key 调用 keybytesToHex() 转为 hex 编码并追加 \16 结尾
+	// Compact 编码时需要记录是否以 \16 结尾的标志，这样从 Compact 解码为 Hex 时才能正确还原
 	if hasTerm(hex) {
 		terminator = 1
 		hex = hex[:len(hex)-1]
 	}
+
 	buf := make([]byte, len(hex)/2+1)
 	buf[0] = terminator << 5 // the flag byte
+
+	// 根据黄皮书，要处理奇偶的原因，主要是为了让数据长度正好为偶数
+	// 理解如下：如果不处理奇偶，编码时因为 nibbles 两辆组队，因此对于奇数长度的 hex，最后一个字符 nibble 无人配对，
+	// 此时它只能在高 16 位，与低16位的 0 组成一个字节；解码时，无法确认低 16 位的 0，是原有数据还是 padding 数据
 	if len(hex)&1 == 1 {
 		buf[0] |= 1 << 4 // odd flag
 		buf[0] |= hex[0] // first nibble is contained in the first byte
 		hex = hex[1:]
 	}
+
 	decodeNibbles(hex, buf[1:])
 	return buf
 }
@@ -84,11 +99,17 @@ func compactToHex(compact []byte) []byte {
 	if len(compact) == 0 {
 		return compact
 	}
+
+	// keybytesToHex 会添加尾部的 \16
 	base := keybytesToHex(compact)
+
+	// 这里根据情况，可能将尾部的 \16 删除
 	// delete terminator flag
 	if base[0] < 2 {
 		base = base[:len(base)-1]
 	}
+
+	// 根据奇偶指向实际数据起始地址
 	// apply odd flag
 	chop := 2 - base[0]&1
 	return base[chop:]
@@ -101,6 +122,9 @@ func keybytesToHex(str []byte) []byte {
 		nibbles[i*2] = b / 16
 		nibbles[i*2+1] = b % 16
 	}
+
+	// 注意这里末尾会补上 16 作为 terminator，用于区分 叶子节点 或 扩展节点
+	// 参考 hasTerm() 的使用
 	nibbles[l-1] = 16
 	return nibbles
 }

@@ -157,11 +157,46 @@ type snapshot interface {
 // The goal of a state snapshot is twofold: to allow direct access to account and
 // storage data to avoid expensive multi-level trie lookups; and to allow sorted,
 // cheap iteration of the account/storage tries for sync aid.
+//
+// Tree 结构
+// Snapshot 使用 Tree 表达，它是一个持久层 layer (diskLayer，如 HEAD-128)，及基于它的多个内存中的 diffLayers 组成
+// 当新的区块提交时，不直接持久化，而是先写到内存 diffLayer 中，跟在前一 diffLayer 之后，理论上应该是一条链
+// 为了节省内存，仅保存最近的 128 层 diffLayers
+// 如果区块重组发生在这 128 层 diffLayers 之内，则可以直接找到分叉所在的 diffLayer，基于它构建新的 diffLayers
+// 因此，实际的 diffLayers 构成了一颗树
+// 如果重组的区块，比 持久化的 diskLayer 区块 还小，则整颗树数据都无效，此时的逻辑待确认 TODO
+//
+// 作用：直接访问 account 和 storage 数据；并支持顺序迭代
+// 文档：
+//   [Ask about Geth: Snapshot acceleration](https://blog.ethereum.org/2020/07/17/ask-about-geth-snapshot-acceleration/)
+//   [Geth v1.10.0](https://blog.ethereum.org/2021/03/03/geth-v1-10-0/)
+//   [Dodging a bullet: Ethereum State Problems](https://blog.ethereum.org/2021/05/18/eth_state_problems/)
+//
+// - A snapshot is a secondary data structure for storing the Ethereum state in a flat format, which can be built fully online, during the live operation of a Geth node.
+// - benefit
+//   - DOS attack-protection
+//     - Instead of doing O(log N) disk reads (x LevelDB overhead: 7 levels) to access an account / storage slot, the snapshot can provide direct, O(1) access time (x LevelDB overhead).
+//       - on mainnet with 140 million accounts, snapshots can save about 8 database lookups per account read.
+//       - Whilst snapshots do grant us a 10x read performance, EVM execution also writes data, and these writes need to be Merkle proven. The Merkle proof requirement retains the necessity for O(logN) disk access on writes.
+//   - Call
+//   - Sync
+//     - With the current Merkle-Patricia state model, these benefactors read 16TB of data off disk to serve a syncing node. Snapshots enable serving nodes to read only 96GB of data off disk to get a new node joined into the network.
+//     - [Ethereum Snapshot Protocol (SNAP)](https://github.com/ethereum/devp2p/blob/master/caps/snap.md)
+// - downside
+//   - snapshot generation: 1 day to 1 week
+//   - the raw account and storage data is essentially duplicated. In the case of mainnet, this means an extra 25GB of SSD space used.
+//
+// A Snapshot is a complete view of the Ethereum state at a given block. Abstract implementation wise, it is a dump of all accounts and storage slots, represented by a flat key-value store.
 type Tree struct {
 	diskdb ethdb.KeyValueStore      // Persistent database to store the snapshot
 	triedb *trie.Database           // In-memory cache to access the trie through
 	cache  int                      // Megabytes permitted to use for read caches
+
+	// key 是 blockRoot，单位是区块; value 含义 TODO
 	layers map[common.Hash]snapshot // Collection of all known layers
+
+	// TODO 掌握 lock 的使用场景
+	// 感觉是控制对 Tree.layers 的并发，主要在 diskRoot()
 	lock   sync.RWMutex
 
 	// Test hooks
@@ -194,6 +229,7 @@ func New(diskdb ethdb.KeyValueStore, triedb *trie.Database, cache int, root comm
 	if !async {
 		defer snap.waitBuild()
 	}
+
 	// Attempt to load a previously persisted snapshot and rebuild one if failed
 	head, disabled, err := loadSnapshot(diskdb, triedb, cache, root, recovery)
 	if disabled {
@@ -208,11 +244,13 @@ func New(diskdb ethdb.KeyValueStore, triedb *trie.Database, cache int, root comm
 		}
 		return nil, err // Bail out the error, don't rebuild automatically.
 	}
+
 	// Existing snapshot loaded, seed all the layers
 	for head != nil {
 		snap.layers[head.Root()] = head
 		head = head.Parent()
 	}
+
 	return snap, nil
 }
 
@@ -298,6 +336,9 @@ func (t *Tree) Snapshot(blockRoot common.Hash) Snapshot {
 // Snapshots returns all visited layers from the topmost layer with specific
 // root and traverses downward. The layer amount is limited by the given number.
 // If nodisk is set, then disk layer is excluded.
+// 调用来源：Pruner.Prune() / Pruner.RecoverPruning()
+// @param root 某个区块的 State Trie 根哈希
+// @return 返回 root 表示的某个区块的前 limits 层 (含 root)
 func (t *Tree) Snapshots(root common.Hash, limits int, nodisk bool) []Snapshot {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
@@ -330,6 +371,9 @@ func (t *Tree) Snapshots(root common.Hash, limits int, nodisk bool) []Snapshot {
 
 // Update adds a new snapshot into the tree, if that can be linked to an existing
 // old parent. It is disallowed to insert a disk layer (the origin of all).
+// 唯一调用来源：StateDB.Commit() -> Snapshot.Update() + Snapshot.Cap()
+// 在提交新区块的状态时，会调用当前函数，参数 blockRoot 为新区块的根哈希，parentRoot 为上一区块的根哈希
+// 基于 parentRoot 添加一层 diffLayer，由 blockRoot 表示新的根哈希
 func (t *Tree) Update(blockRoot common.Hash, parentRoot common.Hash, destructs map[common.Hash]struct{}, accounts map[common.Hash][]byte, storage map[common.Hash]map[common.Hash][]byte) error {
 	// Reject noop updates to avoid self-loops in the snapshot tree. This is a
 	// special case that can only happen for Clique networks where empty blocks
@@ -340,11 +384,14 @@ func (t *Tree) Update(blockRoot common.Hash, parentRoot common.Hash, destructs m
 	if blockRoot == parentRoot {
 		return errSnapshotCycle
 	}
+
 	// Generate a new snapshot on top of the parent
 	parent := t.Snapshot(parentRoot)
 	if parent == nil {
 		return fmt.Errorf("parent [%#x] snapshot missing", parentRoot)
 	}
+
+	// 基于 parent 添加一层 diffLayer，由 blockRoot 表示新的根哈希
 	snap := parent.(snapshot).Update(blockRoot, destructs, accounts, storage)
 
 	// Save the new snapshot for later
@@ -364,16 +411,24 @@ func (t *Tree) Update(blockRoot common.Hash, parentRoot common.Hash, destructs m
 // which may or may not overflow and cascade to disk. Since this last layer's
 // survival is only known *after* capping, we need to omit it from the count if
 // we want to ensure that *at least* the requested number of diff layers remain.
+// 调用来源一：
+// Prune.prune() -> Tree.Cap(); 此时参数 layers 为 0
+// 调用来源二：
+// StateDB.Commit() -> Tree.Update() + Tree.Cap()；
+// StateDB.Commit() 先调用 Tree.Update()，基于前一区块 diffLayer 构建新区块的 diffLayer，
+// 然后调用当前函数 Tree.Cap()，传入参数 root 为新区块的根哈希，layers 固定为 128
 func (t *Tree) Cap(root common.Hash, layers int) error {
 	// Retrieve the head snapshot to cap from
 	snap := t.Snapshot(root)
 	if snap == nil {
 		return fmt.Errorf("snapshot [%#x] missing", root)
 	}
+
 	diff, ok := snap.(*diffLayer)
 	if !ok {
 		return fmt.Errorf("snapshot [%#x] is disk layer", root)
 	}
+
 	// If the generator is still running, use a more aggressive cap
 	diff.origin.lock.RLock()
 	if diff.origin.genMarker != nil && layers > 8 {
@@ -388,6 +443,7 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 	// Flattening the bottom-most diff layer requires special casing since there's
 	// no child to rewire to the grandparent. In that case we can fake a temporary
 	// child for the capping and then remove it.
+	// 仅在由 Prune.prune() -> Snapshot.Cap() 时，参数 layers 为 0
 	if layers == 0 {
 		// If full commit was requested, flatten the diffs and merge onto disk
 		diff.lock.RLock()
@@ -396,8 +452,11 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 
 		// Replace the entire snapshot tree with the flat base
 		t.layers = map[common.Hash]snapshot{base.root: base}
+
 		return nil
 	}
+
+	// 返回被修改的 diskLayer；如果未修改 diskLayer，则返回 nil
 	persisted := t.cap(diff, layers)
 
 	// Remove any layer that is stale or links into a stale layer
@@ -421,19 +480,30 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 			remove(root)
 		}
 	}
+
 	// If the disk layer was modified, regenerate all the cumulative blooms
+	// 如果 diskLayer 有修改，自底向上更新每一层的过滤器
 	if persisted != nil {
 		var rebloom func(root common.Hash)
 		rebloom = func(root common.Hash) {
 			if diff, ok := t.layers[root].(*diffLayer); ok {
 				diff.rebloom(persisted)
 			}
+
+			// 注意这里是个递归，将上层过滤器合并到本层，顺序为：
+			// diffLayer1 <-pull diffLayer0
+			// diffLayer2 <-pull diffLayer1
+			// ...
+			// diffLayerY <-pull diffLayerX
+			// 用 for 遍历 children[root] 的意思，是同一父层可能由多层子层 (即分叉)
 			for _, child := range children[root] {
 				rebloom(child)
 			}
 		}
+
 		rebloom(persisted.root)
 	}
+
 	return nil
 }
 
@@ -448,6 +518,8 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 // which may or may not overflow and cascade to disk. Since this last layer's
 // survival is only known *after* capping, we need to omit it from the count if
 // we want to ensure that *at least* the requested number of diff layers remain.
+// 参数 layers 表示自 diff 往下，保留的 diffLayer 层数；
+// 更深的多层 diffLayers 将通过 flatten() 合并为一层 diffLayer
 func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 	// Dive until we run out of layers or reach the persistent database
 	for i := 0; i < layers-1; i++ {
@@ -459,6 +531,26 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 			return nil
 		}
 	}
+
+	// diffLayer{N+layers-1} <- 参数 diff
+	// ...
+	// diffLayerN+1 <- 临时变量 diff'
+	// diffLayerN <- 临时变量 parent
+	// ...
+	// diffLayer1
+	// diffLayer0
+	// diskLayer
+	//
+	// 处理
+	// 1.找到符合参数 layers 的 diffLayerN，记为 parent
+	// 2.通过 flatten() 合并 parent 到 diffLayer0
+	//
+	// diffLayer{N+layers-1} <- 参数 diff
+	// ...
+	// diffLayerN+1 <- diff'
+	// diffLayer0 <- flattened
+	// diskLayer
+
 	// We're out of layers, flatten anything below, stopping if it's the disk or if
 	// the memory limit is not yet exceeded.
 	switch parent := diff.parent.(type) {
@@ -474,6 +566,7 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 
 		// Flatten the parent into the grandparent. The flattening internally obtains a
 		// write lock on grandparent.
+		// flattened 表示合并后形成的新的 diffLayer
 		flattened := parent.flatten().(*diffLayer)
 		t.layers[flattened.root] = flattened
 
@@ -481,7 +574,12 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 		if t.onFlatten != nil {
 			t.onFlatten()
 		}
+
+		// 指向合并得到的 diffLayer
 		diff.parent = flattened
+
+		// 未超过内存限制，且 diskLayer 不在后台生成中，则直接返回 nil，表示 diskLayer 未修改
+		// 否则，需要中断已有的生成过程，然后将当前的内存数据写入 diskLayer，再重启生成过程
 		if flattened.memory < aggregatorMemoryLimit {
 			// Accumulator layer is smaller than the limit, so we can abort, unless
 			// there's a snapshot being generated currently. In that case, the trie
@@ -494,15 +592,27 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 	default:
 		panic(fmt.Sprintf("unknown data layer: %T", parent))
 	}
+
 	// If the bottom-most layer is larger than our memory cap, persist to disk
+	// 此时 diff.parent 一定是 bottom diffLayer
 	bottom := diff.parent.(*diffLayer)
 
 	bottom.lock.RLock()
+
+	// 将 bottom diffLayer 写入 diskLayer，得到新构建的 diskLayer
+	// diffToDisk() 会将 bottom.stale 修改为 true，表示 bottom 已经失效
 	base := diffToDisk(bottom)
+
 	bottom.lock.RUnlock()
 
+	// 指向新的 diskLayer
 	t.layers[base.root] = base
+
+	// bottom diffLayer 已经写入 diskLayer，需要丢弃 (bottom.stale 在 diffToDisk() 中设置为 true)
+	// 因此 diff 成了 bottom diffLayer，parent 指向 diskLayer
 	diff.parent = base
+
+	// 返回新的 diskLayer
 	return base
 }
 
@@ -511,18 +621,23 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 //
 // The disk layer persistence should be operated in an atomic way. All updates should
 // be discarded if the whole transition if not finished.
+// 调用来源：Tree.Cap() / Tree.cap()
+// 将 bottom diffLayer 写入 diskLayer.cached，返回新构建的 diskLayer
 func diffToDisk(bottom *diffLayer) *diskLayer {
 	var (
 		base  = bottom.parent.(*diskLayer)
 		batch = base.diskdb.NewBatch()
 		stats *generatorStats
 	)
+
 	// If the disk layer is running a snapshot generator, abort it
 	if base.genAbort != nil {
 		abort := make(chan *generatorStats)
 		base.genAbort <- abort
 		stats = <-abort
 	}
+
+	// 删除数据库中此前保存的 snapshot 根节点
 	// Put the deletion in the batch writer, flush all updates in the final step.
 	rawdb.DeleteSnapshotRoot(batch)
 
@@ -531,19 +646,25 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 	if base.stale {
 		panic("parent disk layer is stale") // we've committed into the same base from two children, boo
 	}
+
+	// 将 base.stale 设置为 true
 	base.stale = true
 	base.lock.Unlock()
 
 	// Destroy all the destructed accounts from the database
+	// 遍历被销毁的 accounts' hash
 	for hash := range bottom.destructSet {
 		// Skip any account not covered yet by the snapshot
 		if base.genMarker != nil && bytes.Compare(hash[:], base.genMarker) > 0 {
 			continue
 		}
+
 		// Remove all storage slots
+		// 删除账户的 State Trie 节点
 		rawdb.DeleteAccountSnapshot(batch, hash)
 		base.cache.Set(hash[:], nil)
 
+		// 遍历删除账户的 Storage Trie
 		it := rawdb.IterateStorageSnapshots(base.diskdb, hash)
 		for it.Next() {
 			if key := it.Key(); len(key) == 65 { // TODO(karalabe): Yuck, we should move this into the iterator
@@ -564,15 +685,19 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		}
 		it.Release()
 	}
+
 	// Push all updated accounts into the database
+	// 写入 State Trie
 	for hash, data := range bottom.accountData {
 		// Skip any account not covered yet by the snapshot
 		if base.genMarker != nil && bytes.Compare(hash[:], base.genMarker) > 0 {
 			continue
 		}
+
 		// Push the account to disk
 		rawdb.WriteAccountSnapshot(batch, hash, data)
 		base.cache.Set(hash[:], data)
+
 		snapshotCleanAccountWriteMeter.Mark(int64(len(data)))
 
 		snapshotFlushAccountItemMeter.Mark(1)
@@ -588,7 +713,9 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 			batch.Reset()
 		}
 	}
+
 	// Push all the storage slots into the database
+	// 写入 Storage Trie
 	for accountHash, storage := range bottom.storageData {
 		// Skip any account not covered yet by the snapshot
 		if base.genMarker != nil && bytes.Compare(accountHash[:], base.genMarker) > 0 {
@@ -614,6 +741,8 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 			snapshotFlushStorageSizeMeter.Mark(int64(len(data)))
 		}
 	}
+
+	// 向数据库写入 snapshot 新的根节点 bottom.root
 	// Update the snapshot block marker and write any remainder data
 	rawdb.WriteSnapshotRoot(batch, bottom.root)
 
@@ -625,15 +754,22 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to write leftover snapshot", "err", err)
 	}
+
 	log.Debug("Journalled disk layer", "root", bottom.root, "complete", base.genMarker == nil)
+
+	// 构建新的 diskLayer
+	// 注意这里未对 stale 字段初始化，因此为默认值 false
 	res := &diskLayer{
+		// 注意返回的 diskLayer.root 是原来的 diffLayer(bottom).root
 		root:       bottom.root,
+
 		cache:      base.cache,
 		diskdb:     base.diskdb,
 		triedb:     base.triedb,
 		genMarker:  base.genMarker,
 		genPending: base.genPending,
 	}
+
 	// If snapshot generation hasn't finished yet, port over all the starts and
 	// continue where the previous round left off.
 	//
@@ -653,35 +789,49 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 //
 // The method returns the root hash of the base layer that needs to be persisted
 // to disk as a trie too to allow continuing any pending generation op.
+// 功能：对内存 snapshot Tree 进行序列化，存储到日志中
+// 日志使用：core.NewBlockChain() -> snapshot.New() -> loadSnapshot() -> loadAndParseJournal()
+//
+// 在 geth 节点即将退出时通过 BlockChain.Stop() 调用当前函数，参数 root 为 BlockChain.CurrentBlock().Root()
+// 写入数据为 version + diskRootHash + diffLayer0Serialized + ... diffLayerCurrentBlockSerialized
+// 其中：diffLayerNSerialized 为 diffLayer.rootHash + destructSet + accountData + storageData
 func (t *Tree) Journal(root common.Hash) (common.Hash, error) {
 	// Retrieve the head snapshot to journal from var snap snapshot
 	snap := t.Snapshot(root)
 	if snap == nil {
 		return common.Hash{}, fmt.Errorf("snapshot [%#x] missing", root)
 	}
+
 	// Run the journaling
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
+	// 1.版本号
 	// Firstly write out the metadata of journal
 	journal := new(bytes.Buffer)
 	if err := rlp.Encode(journal, journalVersion); err != nil {
 		return common.Hash{}, err
 	}
+
 	diskroot := t.diskRoot()
 	if diskroot == (common.Hash{}) {
 		return common.Hash{}, errors.New("invalid disk root")
 	}
+
+	// 2.写入 diskroot (diskLayer 表示的根哈希)
 	// Secondly write out the disk layer root, ensure the
 	// diff journal is continuous with disk.
 	if err := rlp.Encode(journal, diskroot); err != nil {
 		return common.Hash{}, err
 	}
+
+	// 3.递归写入 diffLayer 序列化的数据
 	// Finally write out the journal of each layer in reverse order.
 	base, err := snap.(snapshot).Journal(journal)
 	if err != nil {
 		return common.Hash{}, err
 	}
+
 	// Store the journal into the database and return
 	rawdb.WriteSnapshotJournal(t.diskdb, journal.Bytes())
 	return base, nil
@@ -734,6 +884,7 @@ func (t *Tree) Rebuild(root common.Hash) {
 
 // AccountIterator creates a new account iterator for the specified root hash and
 // seeks to a starting account hash.
+// State Trie 的迭代器
 func (t *Tree) AccountIterator(root common.Hash, seek common.Hash) (AccountIterator, error) {
 	ok, err := t.generating()
 	if err != nil {
@@ -747,6 +898,7 @@ func (t *Tree) AccountIterator(root common.Hash, seek common.Hash) (AccountItera
 
 // StorageIterator creates a new storage iterator for the specified root hash and
 // account. The iterator will be move to the specific start position.
+// Storage Trie 的迭代器
 func (t *Tree) StorageIterator(root common.Hash, account common.Hash, seek common.Hash) (StorageIterator, error) {
 	ok, err := t.generating()
 	if err != nil {
@@ -794,24 +946,30 @@ func (t *Tree) Verify(root common.Hash) error {
 // The lock of snapTree is assumed to be held already.
 func (t *Tree) disklayer() *diskLayer {
 	var snap snapshot
+
+	// t.layers 是个 map，这里感觉是随便找个 snapshot 的意思
 	for _, s := range t.layers {
 		snap = s
 		break
 	}
+
 	if snap == nil {
 		return nil
 	}
+
+	// 判断 snapshot 类型
 	switch layer := snap.(type) {
 	case *diskLayer:
 		return layer
 	case *diffLayer:
+		// 返回 snapshot 底层的 diskLayer
 		return layer.origin
 	default:
 		panic(fmt.Sprintf("%T: undefined layer", snap))
 	}
 }
 
-// diskRoot is a internal helper function to return the disk layer root.
+// diskRoot is an internal helper function to return the disk layer root.
 // The lock of snapTree is assumed to be held already.
 func (t *Tree) diskRoot() common.Hash {
 	disklayer := t.disklayer()
@@ -836,7 +994,7 @@ func (t *Tree) generating() (bool, error) {
 	return layer.genMarker != nil, nil
 }
 
-// diskRoot is a external helper function to return the disk layer root.
+// DiskRoot is a external helper function to return the disk layer root.
 func (t *Tree) DiskRoot() common.Hash {
 	t.lock.Lock()
 	defer t.lock.Unlock()

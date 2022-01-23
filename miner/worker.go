@@ -131,25 +131,25 @@ type worker struct {
 	merger      *consensus.Merger
 
 	// Feeds
-	pendingLogsFeed event.Feed
+	pendingLogsFeed event.Feed // 发送方： mainLoop
 
 	// Subscriptions
-	mux          *event.TypeMux
-	txsCh        chan core.NewTxsEvent
+	mux          *event.TypeMux // 发送方： resultLoop，消息是NewMinedBlockEvent
+	txsCh        chan core.NewTxsEvent // 发送方：txpool, 处理方：mainLoop
 	txsSub       event.Subscription
-	chainHeadCh  chan core.ChainHeadEvent
+	chainHeadCh  chan core.ChainHeadEvent // 发送方：账本， 处理方：workLoop
 	chainHeadSub event.Subscription
-	chainSideCh  chan core.ChainSideEvent
+	chainSideCh  chan core.ChainSideEvent // 发送方：账本， 处理方：mainLoop
 	chainSideSub event.Subscription
 
 	// Channels
-	newWorkCh          chan *newWorkReq
-	taskCh             chan *task
-	resultCh           chan *types.Block
-	startCh            chan struct{}
-	exitCh             chan struct{}
-	resubmitIntervalCh chan time.Duration
-	resubmitAdjustCh   chan *intervalAdjust
+	newWorkCh          chan *newWorkReq // 发送方：workLoop，处理方：mainLoop
+	taskCh             chan *task // 发送方：mainLoop， 处理方：taskLoop
+	resultCh           chan *types.Block // 发送方：共识，处理方：resultLoop
+	startCh            chan struct{} //  发送方：启动时和外部api， 处理方：workLoop
+	exitCh             chan struct{} // 发送方：外部， 处理方：所有routine
+	resubmitIntervalCh chan time.Duration // 发送方：外部api，处理方：workLoop
+	resubmitAdjustCh   chan *intervalAdjust // 发送方：mainLoop， 处理方：workLoop
 
 	wg sync.WaitGroup
 
@@ -223,6 +223,8 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 	worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh)
 
 	// Sanitize recommit interval if the user-specified one is too short.
+	// 默认为 3 秒 (ethconfig.Defaults.Miner.Recommit)
+	// 最少为 1 秒
 	recommit := worker.config.Recommit
 	if recommit < minRecommitInterval {
 		log.Warn("Sanitizing miner recommit interval", "provided", recommit, "updated", minRecommitInterval)
@@ -419,6 +421,8 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 				interval = minRecommitInterval
 			}
 			log.Info("Miner recommit interval update", "from", minRecommit, "to", interval)
+
+			// 注意这里两个变量可能被修改
 			minRecommit, recommit = interval, interval
 
 			if w.resubmitHook != nil {
@@ -683,12 +687,14 @@ func (w *worker) resultLoop() {
 func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 	// Retrieve the parent state to execute on top and start a prefetcher for
 	// the miner to speed block sealing up a bit
+	// 获取前一区块的 stateDB，在其基础上执行新区块的交易
 	state, err := w.chain.StateAt(parent.Root())
 	if err != nil {
 		return err
 	}
 	state.StartPrefetcher("miner")
 
+	// 构造新区块的执行环境，主要字段是 state 和 header
 	env := &environment{
 		signer:    types.MakeSigner(w.chainConfig, header.Number),
 		state:     state,
@@ -713,6 +719,8 @@ func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 	if w.current != nil && w.current.state != nil {
 		w.current.state.StopPrefetcher()
 	}
+
+	// 替换为新创建的环境
 	w.current = env
 	return nil
 }
@@ -909,6 +917,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 	defer w.mu.RUnlock()
 
 	tstart := time.Now()
+	// 以最新区块作为 parent
 	parent := w.chain.CurrentBlock()
 
 	if parent.Time() >= uint64(timestamp) {
@@ -955,6 +964,8 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 			}
 		}
 	}
+
+	// 注意，这里会获取 parent 对应的 stateDB 作为当前区块 header 的执行环境
 	// Could potentially happen if starting to mine in an odd state.
 	err := w.makeCurrent(parent, header)
 	if err != nil {
@@ -963,6 +974,7 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 	}
 	// Create the current work task and check any fork transitions needed
 	env := w.current
+
 	if w.chainConfig.DAOForkSupport && w.chainConfig.DAOForkBlock != nil && w.chainConfig.DAOForkBlock.Cmp(header.Number) == 0 {
 		misc.ApplyDAOHardFork(env.state)
 	}
@@ -1006,6 +1018,9 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		w.updateSnapshot()
 		return
 	}
+
+	// TODO 这里是在挖矿，打包本地交易。如果不开启挖矿，走的流程是哪里？
+
 	// Split the pending transactions into locals and remotes
 	localTxs, remoteTxs := make(map[common.Address]types.Transactions), pending
 	for _, account := range w.eth.TxPool().Locals() {

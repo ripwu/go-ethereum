@@ -25,25 +25,43 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+// [Modified Merkle Patricia Trie Specification (also Merkle Patricia Tree)](https://eth.wiki/en/fundamentals/patricia-tree)
 var indices = []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "[17]"}
 
 type node interface {
 	fstring(string) string
-	cache() (hashNode, bool)
+	cache() (hashNode, bool) // 子树坍缩后的 hash
 }
 
 type (
-	fullNode struct {
+	fullNode struct { // 分支节点
+		// 可能的父节点类型：fullNode，shortNode
+		// 可能的子节点类型：
+		//     Children[0-15] 可能是 fullNode, shortNode, hashNode 类型
+		//     但一定不是 valueNode 类型 (这种情况应该是 shortNode({Key: 16(terminator, Val)}))
+		//
+		// Children[16] 如果存在的话，一定是 valueNode 类型
+		// 实际中 Children[16] 应该不存在：
+		//   因为 SecureTrie 对所有 key 做了哈希，路径都是 64 半字节。所以 Children[16] 如果存在，意味着这个节点的总路径已经为 64 半字节；
+		//   而 fullNode 意味着还有更下层，即长度超过 65 半字节的路径，这不可能
 		Children [17]node // Actual trie node data to encode/decode (needs custom encoder)
-		flags    nodeFlag
+
+		flags    nodeFlag // flags 是小写，所以不会被 hashFullNodeChildren() encode....
 	}
-	shortNode struct {
+
+	shortNode struct { // 扩展节点/叶子节点
+		// 可能的父节点类型：fullNode，不可能是 shortNode
+		// 可能的子节点类型：
+		//   如果 Key 是否有 terminator，则当前节点为叶子节点，此时 Val 为 valueNode 类型
+		//   否则，Val 只可能是 fullNode 或 hashNode 类型，一定不是 valueNode 或 shortNode 类型
 		Key   []byte
 		Val   node
-		flags nodeFlag
+
+		flags nodeFlag // flags 是小写，所以不会被 hashShortNodeChildren() encode....
 	}
-	hashNode  []byte
-	valueNode []byte
+
+	hashNode  []byte // 需要从 database 中加载后重新展开
+	valueNode []byte // 叶子节点
 )
 
 // nilValueNode is used when collapsing internal trie nodes for hashing, since
@@ -54,6 +72,8 @@ var nilValueNode = valueNode(nil)
 func (n *fullNode) EncodeRLP(w io.Writer) error {
 	var nodes [17]node
 
+	// 如果 child 为 nil，直接调用 rlp.Encode 将 panic: reflect: call of reflect.Value.Type on zero Value
+	// 因此，这里替换为 valueNode(nil)，使得其 RLP 编码正常，得到结果为 [128]
 	for i, child := range &n.Children {
 		if child != nil {
 			nodes[i] = child
@@ -70,6 +90,10 @@ func (n *shortNode) copy() *shortNode { copy := *n; return &copy }
 // nodeFlag contains caching-related metadata about a node.
 type nodeFlag struct {
 	hash  hashNode // cached hash of the node (may be nil)
+
+	// dirty 含义：修改(树结构变化)后是否提交到 Database.dirties
+	// 任何时候都注意：node 创建后就不修改了，包括 hash 和 dirty
+	// 想要修改，都是新建节点
 	dirty bool     // whether the node has changes that must be written to the database
 }
 
@@ -123,10 +147,10 @@ func decodeNode(hash, buf []byte) (node, error) {
 		return nil, fmt.Errorf("decode error: %v", err)
 	}
 	switch c, _ := rlp.CountValues(elems); c {
-	case 2:
+	case 2: // 扩展节点 或 叶子节点
 		n, err := decodeShort(hash, elems)
 		return n, wrapError(err, "short")
-	case 17:
+	case 17: // 分支节点
 		n, err := decodeFull(hash, elems)
 		return n, wrapError(err, "full")
 	default:
@@ -139,16 +163,24 @@ func decodeShort(hash, elems []byte) (node, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 注意这里新建的 nodeFlag 默认 dirty 为 false
 	flag := nodeFlag{hash: hash}
 	key := compactToHex(kbuf)
+
+	// 根据 key 是否有 terminator，分为 叶子节点 或 扩展节点
 	if hasTerm(key) {
 		// value node
 		val, _, err := rlp.SplitString(rest)
 		if err != nil {
 			return nil, fmt.Errorf("invalid value node: %v", err)
 		}
+
+		// 叶子节点，value 就是真实数据，类型为 valueNode
 		return &shortNode{key, append(valueNode{}, val...), flag}, nil
 	}
+
+	// 否则，为 扩展节点，value 为到下一 分支节点 的引用
 	r, _, err := decodeRef(rest)
 	if err != nil {
 		return nil, wrapError(err, "val")
@@ -170,6 +202,7 @@ func decodeFull(hash, elems []byte) (*fullNode, error) {
 		return n, err
 	}
 	if len(val) > 0 {
+		// 如果存在，则一定是 valueNode 类型
 		n.Children[16] = append(valueNode{}, val...)
 	}
 	return n, nil
@@ -177,6 +210,7 @@ func decodeFull(hash, elems []byte) (*fullNode, error) {
 
 const hashLen = len(common.Hash{})
 
+// buf 可能是 hashNode，也可能是 rlp(key, value) < 32 的 shortNode 或 fullNode
 func decodeRef(buf []byte) (node, []byte, error) {
 	kind, val, rest, err := rlp.Split(buf)
 	if err != nil {
@@ -190,12 +224,15 @@ func decodeRef(buf []byte) (node, []byte, error) {
 			err := fmt.Errorf("oversized embedded node (size is %d bytes, want size < %d)", size, hashLen)
 			return nil, buf, err
 		}
+
+		// buf 可能是 shortNode 或 fullNode
 		n, err := decodeNode(nil, buf)
 		return n, rest, err
 	case kind == rlp.String && len(val) == 0:
 		// empty node
 		return nil, rest, nil
 	case kind == rlp.String && len(val) == 32:
+		// val 确定是 hashNode
 		return append(hashNode{}, val...), rest, nil
 	default:
 		return nil, nil, fmt.Errorf("invalid RLP string size %d (want 0 or 32)", len(val))

@@ -61,6 +61,12 @@ func (n *proofList) Delete(key []byte) error {
 // nested states. It's the general query interface to retrieve:
 // * Contracts
 // * Accounts
+// StateDB 管理两层 Trie 树：
+//   通过 Trie (某个 block) 管理 contracts 和 accounts 的 State Trie
+//   通过 stateObjects 管理 Storage Trie
+// 感觉可以看成是 db 的内存缓存层，可能从 db 读数据，但不直接写 db
+// 修改操作都在内存中，需要显式调用 Commit 才能提交
+// 因为有内存 journal，因此可以方便地回滚至指定版本
 type StateDB struct {
 	db           Database
 	prefetcher   *triePrefetcher
@@ -69,7 +75,7 @@ type StateDB struct {
 	hasher       crypto.KeccakState
 
 	snaps         *snapshot.Tree
-	snap          snapshot.Snapshot
+	snap          snapshot.Snapshot // 区块对应的 snap
 	snapDestructs map[common.Hash]struct{}
 	snapAccounts  map[common.Hash][]byte
 	snapStorage   map[common.Hash]map[common.Hash][]byte
@@ -125,11 +131,16 @@ type StateDB struct {
 }
 
 // New creates a new state from a given trie.
+// @param root 前一个区块的根哈希
+// @param snaps
+//	 似乎只在 core/blockchain.go 和 blockchain_reader.go 中赋值，其他场景都是 nil
+//   最常见的是 BlockChainAPI -> func (bc *BlockChain) StateAt(root common.Hash) 会传入 bc.snaps
 func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) {
 	tr, err := db.OpenTrie(root)
 	if err != nil {
 		return nil, err
 	}
+
 	sdb := &StateDB{
 		db:                  db,
 		trie:                tr,
@@ -144,6 +155,7 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 		accessList:          newAccessList(),
 		hasher:              crypto.NewKeccakState(),
 	}
+
 	if sdb.snaps != nil {
 		if sdb.snap = sdb.snaps.Snapshot(root); sdb.snap != nil {
 			sdb.snapDestructs = make(map[common.Hash]struct{})
@@ -776,7 +788,7 @@ func (s *StateDB) GetRefund() uint64 {
 // into the tries just yet. Only IntermediateRoot or Commit will do that.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 	addressesToPrefetch := make([][]byte, 0, len(s.journal.dirties))
-	for addr := range s.journal.dirties {
+	for addr := range s.journal.dirties { // 更细 journal.dirties，调用 obj.finalise，// 将 dirtyStorage 写入 pendingStorage
 		obj, exist := s.stateObjects[addr]
 		if !exist {
 			// ripeMD is 'touched' at block 1714175, in tx 0x1237f737031e40bcde4a8b7e717b2d15e3ecadfe49bb1bbc71ee9deb09c6fcf2
@@ -820,6 +832,12 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 // IntermediateRoot computes the current root hash of the state trie.
 // It is called in between transactions to get the root hash that
 // goes into transaction receipts.
+// 计算中间状态的 root hash，这里中间状态 Intermediate 的意思是，同一区块存在多笔交易，
+// applyTransaction() 每执行完一笔交易后都会调用当前函数，得到中间状态的 root hash，
+// 记录在交易对应的收据 Receipt.PostState 中
+// XXX 理解：参考 applyTransaction() 的实现，实际通过 EIP98 去掉了上面的处理，而是仅在
+// 所有交易执行完成后需要提交时，由 StateDB.Commit() 调用 StateDB.IntermediateRoot()
+// 计算最后一笔交易执行后的 root Hash，因此，虽然名字为 Intermediate，但此时其实是最终状态了
 func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	// Finalise all the dirty storage states and write them into the tries
 	s.Finalise(deleteEmptyObjects)
@@ -856,6 +874,8 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.trie = trie
 		}
 	}
+
+	// 更新 stateTrie 的账户信息(nonce, balance, storageRoot, codeHash)
 	usedAddrs := make([][]byte, 0, len(s.stateObjectsPending))
 	for addr := range s.stateObjectsPending {
 		if obj := s.stateObjects[addr]; obj.deleted {
@@ -865,6 +885,8 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.updateStateObject(obj)
 			s.AccountUpdated += 1
 		}
+
+		// 注释中 closure 的意思 addr 复用同一块内存 (:= range )
 		usedAddrs = append(usedAddrs, common.CopyBytes(addr[:])) // Copy needed for closure
 	}
 	if prefetcher != nil {
@@ -897,14 +919,22 @@ func (s *StateDB) clearJournalAndRefund() {
 }
 
 // Commit writes the state to the underlying in-memory trie database.
+// @return common.Hash 整棵 trie 树的根 hash
+//
+// 看起来只在 core/blockchain.go 和 eth/state_accessor.go 中被调用
+// 注意：这里 Commit() 时，不会实际落盘，而是更新到 Database.dirties 内存缓存中，调用路径为
+// StateDB.Commit() -> SecureTrie.Commit() -> Trie.Commit() -> Database.insert()
+// 实际落盘是由 worker.go 调用 Database.Commit() -> commit() -> batch.Write()
 func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 	if s.dbErr != nil {
 		return common.Hash{}, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
 	}
 	// Finalize any pending changes and merge everything into the tries
+	// 首先将 stateObjectsPending 的账户数据，从内存缓存中更新到 State Trie，这里可能会引起 State Trie 结构的变化
 	s.IntermediateRoot(deleteEmptyObjects)
 
 	// Commit objects to the trie, measuring the elapsed time
+	// 然后遍历账户，调用 CommitTrie() 更新 Storage Trie，并提交到 db.dirties
 	var storageCommitted int
 	codeWriter := s.db.TrieDB().DiskDB().NewBatch()
 	for addr := range s.stateObjectsDirty {
@@ -915,6 +945,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 				obj.dirtyCode = false
 			}
 			// Write any storage changes in the state object to its storage trie
+			// 提交 storageTrie
 			committed, err := obj.CommitTrie(s.db)
 			if err != nil {
 				return common.Hash{}, err
@@ -922,27 +953,41 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 			storageCommitted += committed
 		}
 	}
+
 	if len(s.stateObjectsDirty) > 0 {
 		s.stateObjectsDirty = make(map[common.Address]struct{})
 	}
+
 	if codeWriter.ValueSize() > 0 {
 		if err := codeWriter.Write(); err != nil {
 			log.Crit("Failed to commit dirty codes", "error", err)
 		}
 	}
+
 	// Write the account trie changes, measuing the amount of wasted time
 	var start time.Time
 	if metrics.EnabledExpensive {
 		start = time.Now()
 	}
+
 	// The onleaf func is called _serially_, so we can reuse the same account
 	// for unmarshalling every time.
+	// 最后提交 State Trie，写入 Database.dirties
 	var account types.StateAccount
+	// 注意这里 SecureTrie.Commit() 是个同步操作，会坍塌整棵树，并返回根 hash
 	root, accountCommitted, err := s.trie.Commit(func(_ [][]byte, _ []byte, leaf []byte, parent common.Hash) error {
+		// committer.commitLoop() 会判断节点类型进行回调：
+		// 参数 parent：当前节点的 hash，当前节点可能为 shortNode 或 fullNode
+		// 参数 leaf：shortNode.Val 为 valueNode， 或 fullNode.children[16] 存在且为 valueNode
+		// 换句话说，对于 State Trie，真实的数据 StateAccount 只存在与这两种类型的节点中
+
 		if err := rlp.DecodeBytes(leaf, &account); err != nil {
 			return nil
 		}
+
 		if account.Root != emptyRoot {
+			// 理解：这里引用，要和 Database.deference() 递归解引用结合起来看
+			// 这里是建立 parent 到 storageRoot 指向的树根哈希 的引用
 			s.db.TrieDB().Reference(account.Root, parent)
 		}
 		return nil
@@ -962,16 +1007,21 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		s.AccountUpdated, s.AccountDeleted = 0, 0
 		s.StorageUpdated, s.StorageDeleted = 0, 0
 	}
+
 	// If snapshotting is enabled, update the snapshot tree with this new version
 	if s.snap != nil {
 		if metrics.EnabledExpensive {
 			defer func(start time.Time) { s.SnapshotCommits += time.Since(start) }(time.Now())
 		}
+
 		// Only update if there's a state transition (skip empty Clique blocks)
 		if parent := s.snap.Root(); parent != root {
+			// 1.先构建新的一层 diffLayer
 			if err := s.snaps.Update(root, parent, s.snapDestructs, s.snapAccounts, s.snapStorage); err != nil {
 				log.Warn("Failed to update snapshot tree", "from", parent, "to", root, "err", err)
 			}
+
+			// 2.再限制 diffLayer 总数
 			// Keep 128 diff layers in the memory, persistent layer is 129th.
 			// - head layer is paired with HEAD state
 			// - head-1 layer is paired with HEAD-1 state
@@ -980,6 +1030,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 				log.Warn("Failed to cap snapshot tree", "root", root, "layers", 128, "err", err)
 			}
 		}
+
 		s.snap, s.snapDestructs, s.snapAccounts, s.snapStorage = nil, nil, nil, nil
 	}
 	return root, err

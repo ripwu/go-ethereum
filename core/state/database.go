@@ -40,9 +40,11 @@ const (
 // Database wraps access to tries and contract code.
 type Database interface {
 	// OpenTrie opens the main account trie.
+	// 状态树
 	OpenTrie(root common.Hash) (Trie, error)
 
 	// OpenStorageTrie opens the storage trie of an account.
+	// 存储树
 	OpenStorageTrie(addrHash, root common.Hash) (Trie, error)
 
 	// CopyTrie returns an independent copy of the given trie.

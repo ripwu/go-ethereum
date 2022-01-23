@@ -159,6 +159,8 @@ var defaultCacheConfig = &CacheConfig{
 // canonical chain.
 type BlockChain struct {
 	chainConfig *params.ChainConfig // Chain & network configuration
+
+	// 默认配置为 defaultCacheConfig
 	cacheConfig *CacheConfig        // Cache configuration for pruning
 
 	db     ethdb.Database // Low level persistent database to store final content in
@@ -1185,6 +1187,8 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	//
 	// Note all the components of block(td, hash->number map, header, body, receipts)
 	// should be written atomically. BlockBatch is used for containing all components.
+
+	// Block 数据一定会写入数据库
 	blockBatch := bc.db.NewBatch()
 	rawdb.WriteTd(blockBatch, block.Hash(), block.NumberU64(), externTd)
 	rawdb.WriteBlock(blockBatch, block)
@@ -1193,34 +1197,67 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	if err := blockBatch.Write(); err != nil {
 		log.Crit("Failed to write block into disk", "err", err)
 	}
+
+	// 再将 State Trie(状态修改) 提交到 Database.dirties
 	// Commit all cached state changes into underlying memory database.
 	root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number()))
 	if err != nil {
 		return err
 	}
+
 	triedb := bc.stateCache.TrieDB()
 
 	// If we're running an archive node, always flush
+	// XXX 注意这里：默认配置为 false
+	// 因此区块对应的 State Trie 默认不会由 triedb.Commit() 写入磁盘
 	if bc.cacheConfig.TrieDirtyDisabled {
+		// 将 Database.dirties 实际落盘
 		return triedb.Commit(root, false, nil)
 	} else {
+		// 默认配置进来这里，只在 gcproc 超时时提交 HEAD-128 区块，否则不会提交区块
+
+		// 下面的逻辑，先引用最新哈希 (triedb.Reference())，再解引用 HEAD-128 区块
+		// 解引用时，如果区块引用为0，将从 dirties 中删除 (参考 Database.deference() 代码)
+
+		// ## 请求 < HEAD-128 区块
+		//
+		// 正常而言，如果请求 128 个区块之前的区块，将经历下面的调用链，查找区块对应的节点：
+		// BlockChain.StateAt() -> ... -> Trie.resolveHash() -> Database.node()，
+		// 此时 Database 缓存和 leveldb 都找不到该节点，因为：
+		// Database.dirties 已被 Database.deference() 解引用逻辑做了删除
+		// Database.cleans 和 disdb.Get()，因为这里未调用 triedb.Commit()，所以不会被写入
+		//
+		// 因此，前端将收到如下错误信息：
+		// fmt.Sprintf("missing trie node %x (path %x)", err.NodeHash, err.Path)
+
 		// Full but not archive node, do proper garbage collection
+		// 引用 HEAD 区块
 		triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive
+
+		// 将当前区块放入 gc 优先级队列
 		bc.triegc.Push(root, -int64(block.NumberU64()))
 
+		// TriesInMemory: 128
 		if current := block.NumberU64(); current > TriesInMemory {
 			// If we exceeded our memory allowance, flush matured singleton nodes to disk
 			var (
 				nodes, imgs = triedb.Size()
+
+				// 默认配置为 256，即 limit 为 256M 内存
 				limit       = common.StorageSize(bc.cacheConfig.TrieDirtyLimit) * 1024 * 1024
 			)
+
 			if nodes > limit || imgs > 4*1024*1024 {
+				// IdealBatchSize: 100 * 1024
 				triedb.Cap(limit - ethdb.IdealBatchSize)
 			}
+
 			// Find the next state trie we need to commit
+			// 第 HEAD-128 区块
 			chosen := current - TriesInMemory
 
 			// If we exceeded out time allowance, flush an entire trie to disk
+			// 默认配置为 5 分钟
 			if bc.gcproc > bc.cacheConfig.TrieTimeLimit {
 				// If the header is missing (canonical chain behind), we're reorging a low
 				// diff sidechain. Suspend committing until this operation is completed.
@@ -1239,13 +1276,18 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 					bc.gcproc = 0
 				}
 			}
+
 			// Garbage collect anything below our required write retention
+			// 处理 gc 优先级队列
 			for !bc.triegc.Empty() {
 				root, number := bc.triegc.Pop()
 				if uint64(-number) > chosen {
+					// 按原优先级放回..
 					bc.triegc.Push(root, number)
 					break
 				}
+
+				// 解引用，释放 HEAD-128 区块
 				triedb.Dereference(root.(common.Hash))
 			}
 		}
@@ -1253,7 +1295,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	return nil
 }
 
-// WriteBlockWithState writes the block and all associated state to the database.
+// WriteBlockAndSetHead writes the block and all associated state to the database.
 func (bc *BlockChain) WriteBlockAndSetHead(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state *state.StateDB, emitHeadEvent bool) (status WriteStatus, err error) {
 	if !bc.chainmu.TryLock() {
 		return NonStatTy, errChainStopped
