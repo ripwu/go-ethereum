@@ -80,9 +80,35 @@ type stateObject struct {
 	trie Trie // storage trie, which becomes non-nil on first access
 	code Code // contract bytecode, which gets set when code is loaded
 
+	// 理解：pendingStorage 注释 at the end of an entire block 的意思
+	// 参考：
+	//   [Remove medstate from receipts](https://github.com/ethereum/EIPs/issues/98)
+	//   [core/state: accumulate writes and only update tries when must #19953](https://github.com/ethereum/go-ethereum/pull/19953)
+	//   [core/state: revert noop finalise, fix copy-commit-copy #20113](https://github.com/ethereum/go-ethereum/pull/20113)
+	//
+	// Byzantium 后，receipt.PostState 废弃，收据不再记录每一笔交易执行后重新计算得到的根哈希；
+	// 利用这个特性，之前简单跳过了对 Trie 根哈希的计算，但每笔交易后仍然会更新 Trie 本身，导致
+	// Trie 树结构变化，而这是可以优化的
+	//
+	// 因此，引入 pendingStorage 缓存，每笔交易执行后，不再更新 Trie 树，而是先合并更新到缓存；
+	// 最后实际需要时，才调用 StateDB.Commit() 更新 Trie 树
+
+	// 在单笔交易执行后 finalise() 会对 originStorage 预取，该字段缓存了 Storage Trie 中原始的值
+	// 在 updateTrie() 中，会判断 pendingStorage[key] 是否等于 originStorage[key]，是的话说明
+	// value 相同，可以跳过，减少 Storage Trie 树结构的变化，间接减少对 Database.dirties 的修改
 	originStorage  Storage // Storage cache of original entries to dedup rewrites, reset for every transaction
+
+	// 缓存同一区块内多笔交易的累计修改
+	// 理解：多笔交易可能对同一 slot 修改，因此通过当前缓存做了合并，保留最后一次修改
+	// 重置：stateObject.updateTrie() 遍历 pendingStorage 写入 originStorage 后重置
+	//      updateTrie() 调用来源： stateObject.updateRoot() / stateObject.CommitTrie()
 	pendingStorage Storage // Storage entries that need to be flushed to disk, at the end of an entire block
+
+	// 缓存当前这笔交易的修改
+	// 理解：一笔交易可能多次对同一 slot 修改，因此通过当前缓存做了合并，保留最后一次修改
+	// 重置：stateObject.finalise() 遍历 dirtyStorage 写入 pendingStorage 后重置
 	dirtyStorage   Storage // Storage entries that have been modified in the current transaction execution
+
 	fakeStorage    Storage // Fake storage which constructed by caller for debugging purpose.
 
 	// Cache flags.
@@ -305,18 +331,26 @@ func (s *stateObject) setState(key, value common.Hash) {
 
 // finalise moves all dirty storage slots into the pending area to be hashed or
 // committed later. It is invoked at the end of every transaction.
-// 将 dirtyStorage 写入 pendingStorage
+// 调用来源：applyTransaction() -> StateDB.Finalise() -> obj.finalise()
+// 每执行一笔交易后，都会调用当前函数
+// 遍历 dirtyStorage 写入 pendingStorage
 func (s *stateObject) finalise(prefetch bool) {
 	slotsToPrefetch := make([][]byte, 0, len(s.dirtyStorage))
+
 	for key, value := range s.dirtyStorage {
 		s.pendingStorage[key] = value
+
+		// TODO 这里为什么不判断 s.originStorage[key] 不存在，仅在不存在时预取
 		if value != s.originStorage[key] {
 			slotsToPrefetch = append(slotsToPrefetch, common.CopyBytes(key[:])) // Copy needed for closure
 		}
 	}
+
 	if s.db.prefetcher != nil && prefetch && len(slotsToPrefetch) > 0 && s.data.Root != emptyRoot {
 		s.db.prefetcher.prefetch(s.data.Root, slotsToPrefetch)
 	}
+
+	// 重置 s.dirtyStorage
 	if len(s.dirtyStorage) > 0 {
 		s.dirtyStorage = make(Storage)
 	}
@@ -324,35 +358,44 @@ func (s *stateObject) finalise(prefetch bool) {
 
 // updateTrie writes cached storage modifications into the object's storage trie.
 // It will return nil if the trie has not been loaded and no changes have been made
-// 将 pendingStorage 写入 originStorage
+// 调用来源：StateDB.IntermediateRoot() -> stateObject.updateRoot()
+//     或者 StateDB.Commit() -> stateObject.CommitTrie()
+// 将 pendingStorage 写入 originStorage，并提交到 Storage Trie
 func (s *stateObject) updateTrie(db Database) Trie {
 	// Make sure all dirty slots are finalized into the pending storage area
+	// 遍历 dirtyStorage 写入 pendingStorage
 	s.finalise(false) // Don't prefetch anymore, pull directly if need be
+
 	if len(s.pendingStorage) == 0 {
 		return s.trie
 	}
+
 	// Track the amount of time wasted on updating the storage trie
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.db.StorageUpdates += time.Since(start) }(time.Now())
 	}
+
 	// The snapshot storage map for the object
 	var storage map[common.Hash][]byte
 
 	// Insert all the pending updates into the trie
-	// 这个 tr 是 当前账户对应的storageTrie
+	// 这里 tr 是 当前账户对应的storageTrie
 	tr := s.getTrie(db)
 	hasher := s.db.hasher
 
 	usedStorage := make([][]byte, 0, len(s.pendingStorage))
-	// pendingStorage 写入 originStorage，并提交到 tr
+
+	// 遍历 pendingStorage 写入 originStorage，并提交到 tr
 	for key, value := range s.pendingStorage {
 		// Skip noop changes, persist actual changes
 		if value == s.originStorage[key] {
 			continue
 		}
+
+		// TODO 没看明白这里修改的必要..
 		s.originStorage[key] = value
 
-		// 注意这里通过 tr.TryDelete 或者 tr.TryUpdate 将 <key, v> 提交到了 storageTrie
+		// 注意这里通过 tr.TryDelete 或者 tr.TryUpdate 将 <key, v> 提交到了 Storage Trie
 		var v []byte
 		if (value == common.Hash{}) {
 			s.setError(tr.TryDelete(key[:]))
@@ -364,6 +407,7 @@ func (s *stateObject) updateTrie(db Database) Trie {
 			s.setError(tr.TryUpdate(key[:], v))
 			s.db.StorageUpdated += 1
 		}
+
 		// If state snapshotting is active, cache the data til commit
 		if s.db.snap != nil {
 			if storage == nil {
@@ -373,39 +417,52 @@ func (s *stateObject) updateTrie(db Database) Trie {
 					s.db.snapStorage[s.addrHash] = storage
 				}
 			}
+
 			storage[crypto.HashData(hasher, key[:])] = v // v will be nil if it's deleted
 		}
+
 		usedStorage = append(usedStorage, common.CopyBytes(key[:])) // Copy needed for closure
 	}
+
 	if s.db.prefetcher != nil {
 		s.db.prefetcher.used(s.data.Root, usedStorage)
 	}
+
+	// 重置 s.pendingStorage
 	if len(s.pendingStorage) > 0 {
 		s.pendingStorage = make(Storage)
 	}
+
 	return tr
 }
 
 // UpdateRoot sets the trie root to the current root hash of
+// 将缓存提交到 Storage Trie 并计算根哈希，更新 storageRoot
 func (s *stateObject) updateRoot(db Database) {
 	// If nothing changed, don't bother with hashing anything
 	if s.updateTrie(db) == nil {
 		return
 	}
+
 	// Track the amount of time wasted on hashing the storage trie
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.db.StorageHashes += time.Since(start) }(time.Now())
 	}
+
+	// 写入 Account.storageRoot
 	s.data.Root = s.trie.Hash()
 }
 
 // CommitTrie the storage trie of the object to db.
 // This updates the trie root.
+// 1.调用 stateObject.updateTrie() 将 dirtyStorage 写入 pendingStorage，再将后者写入 Storage Trie 并重置
+// 2.调用 Trie.Commit() 将 Storage Trie 提交到 Database.dirties
 func (s *stateObject) CommitTrie(db Database) (int, error) {
 	// If nothing changed, don't bother with hashing anything
 	if s.updateTrie(db) == nil {
 		return 0, nil
 	}
+
 	if s.dbErr != nil {
 		return 0, s.dbErr
 	}
@@ -413,10 +470,13 @@ func (s *stateObject) CommitTrie(db Database) (int, error) {
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.db.StorageCommits += time.Since(start) }(time.Now())
 	}
+
+	// 将 Storage Trie 提交到 Database.dirties
 	root, committed, err := s.trie.Commit(nil)
 	if err == nil {
 		s.data.Root = root
 	}
+
 	return committed, err
 }
 
@@ -425,6 +485,11 @@ func (s *stateObject) CommitTrie(db Database) (int, error) {
 func (s *stateObject) AddBalance(amount *big.Int) {
 	// EIP161: We must check emptiness for the objects such that the account
 	// clearing (0,0,0 objects) can take effect.
+
+	// 在 EIP-161 (最早是 EIP-158 提出，后被 161 取代) 之前空的账户存在 trie 树中，在合约层面
+	// 这和不存在 trie 树中的账户其实是一回事，所以其实是没必要存储的。因此 EIP-161 规定这种空账
+	// 户不存 trie。为了把之前存的空账户删除掉，在转账额度为 0 的时候也会写一个 journal 日志，相
+	// 当于渐进式的删除
 	if amount.Sign() == 0 {
 		if s.empty() {
 			s.touch()

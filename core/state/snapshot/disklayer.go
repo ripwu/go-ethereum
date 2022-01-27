@@ -38,6 +38,9 @@ type diskLayer struct {
 	cache  *fastcache.Cache    // Cache to avoid hitting the disk for direct access
 
 	root  common.Hash // Root hash of the base snapshot
+
+	// 调用来源：diffToDisk() 或 Tree.Disable() 或 Tree.Rebuild()
+	// 在 diffToDisk() 中被设置为 true，表示旧的 diskLayer 已经过期，磁盘中已经写入新的 diskLayer 数据
 	stale bool        // Signals that the layer became stale (state progressed)
 
 	genMarker  []byte                    // Marker for the state that's indexed during initial layer generation

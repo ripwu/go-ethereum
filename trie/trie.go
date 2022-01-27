@@ -609,6 +609,7 @@ func (t *Trie) Commit(onleaf LeafCallback) (common.Hash, int, error) {
 			h.commitLoop(t.db)
 		}()
 	}
+
 	newRoot, committed, err := h.Commit(t.root, t.db)
 	if onleaf != nil {
 		// The leafCh is created in newCommitter if there was an onleaf callback
@@ -624,6 +625,7 @@ func (t *Trie) Commit(onleaf LeafCallback) (common.Hash, int, error) {
 		close(h.leafCh)
 		wg.Wait()
 	}
+
 	if err != nil {
 		return common.Hash{}, 0, err
 	}

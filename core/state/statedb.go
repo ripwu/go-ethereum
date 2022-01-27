@@ -65,7 +65,7 @@ func (n *proofList) Delete(key []byte) error {
 //   通过 Trie (某个 block) 管理 contracts 和 accounts 的 State Trie
 //   通过 stateObjects 管理 Storage Trie
 // 感觉可以看成是 db 的内存缓存层，可能从 db 读数据，但不直接写 db
-// 修改操作都在内存中，需要显式调用 Commit 才能提交
+// 修改操作都在内存中，需要显式调用 Commit 才能提会提交到 Trie
 // 因为有内存 journal，因此可以方便地回滚至指定版本
 type StateDB struct {
 	db           Database
@@ -76,13 +76,34 @@ type StateDB struct {
 
 	snaps         *snapshot.Tree
 	snap          snapshot.Snapshot // 区块对应的 snap
+
+	// TODO 理解
+	// 当交易创建新账户时，写入老账户；当交易修改从 dirty 刷入 pending 的时候写入，
+	// 不能像下面那样在区块层面写入，因为同一个区块中可以有多笔交易，前者销毁，后者创建，
+	// 尽管最后这个账户留下来了，但之前的存储得销毁掉。
 	snapDestructs map[common.Hash]struct{}
 	snapAccounts  map[common.Hash][]byte
 	snapStorage   map[common.Hash]map[common.Hash][]byte
 
 	// This map holds 'live' objects, which will get modified while processing a state transition.
 	stateObjects        map[common.Address]*stateObject
+
+	// 参考 stateObject 中的注释说明
+
+	// 当前区块累计修改的账户
+	// 1.写入：每笔交易执行后 applyTransaction() -> StateDB.Finalise() -> obj.finalise()
+	//        将 dirtyStorage 写入 pendingStorage
+	// 2.重置：区块所有交易执行后 BlockChain.writeBlockWithState() -> StateDB.Commit() -> IntermediateRoot() -> obj.updateTrie()
+	//        将 pendingStorage 写入 originStorage，并提交到 Storage Trie
 	stateObjectsPending map[common.Address]struct{} // State objects finalized but not yet written to the trie
+
+	// TODO 注释 in the current execution 感觉不准确
+	// 当前区块累计修改的账户
+	// 1.写入：每笔交易执行后 applyTransaction() -> StateDB.Finalise() -> finalise()
+	//        将 dirtyStorage 写入 pendingStorage
+	// 删除(某个账户)：journal createObjectChange.revert()
+	// 重置：区块所有交易执行后 BlockChain.writeBlockWithState() -> StateDB.Commit() -> obj.CommitTrie()
+	//      将 Storage Trie 提交到 Database.dirties
 	stateObjectsDirty   map[common.Address]struct{} // State objects modified in the current execution
 
 	// DB error.
@@ -465,11 +486,13 @@ func (s *StateDB) Suicide(addr common.Address) bool {
 //
 
 // updateStateObject writes the given object to the trie.
+// 实际提交缓存数据到 State Trie
 func (s *StateDB) updateStateObject(obj *stateObject) {
 	// Track the amount of time wasted on updating the account from the trie
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.AccountUpdates += time.Since(start) }(time.Now())
 	}
+
 	// Encode the account and update the account trie
 	addr := obj.Address()
 	if err := s.trie.TryUpdateAccount(addr[:], &obj.data); err != nil {
@@ -671,6 +694,7 @@ func (s *StateDB) Copy() *StateDB {
 		journal:             newJournal(),
 		hasher:              crypto.NewKeccakState(),
 	}
+
 	// Copy the dirty states, logs, and preimages
 	for addr := range s.journal.dirties {
 		// As documented [here](https://github.com/ethereum/go-ethereum/pull/16485#issuecomment-380438527),
@@ -687,6 +711,7 @@ func (s *StateDB) Copy() *StateDB {
 			state.stateObjectsPending[addr] = struct{}{} // Mark the copy pending to force external (account) commits
 		}
 	}
+
 	// Above, we don't copy the actual journal. This means that if the copy is copied, the
 	// loop above will be a no-op, since the copy's journal is empty.
 	// Thus, here we iterate over stateObjects, to enable copies of copies
@@ -696,12 +721,14 @@ func (s *StateDB) Copy() *StateDB {
 		}
 		state.stateObjectsPending[addr] = struct{}{}
 	}
+
 	for addr := range s.stateObjectsDirty {
 		if _, exist := state.stateObjects[addr]; !exist {
 			state.stateObjects[addr] = s.stateObjects[addr].deepCopy(state)
 		}
 		state.stateObjectsDirty[addr] = struct{}{}
 	}
+
 	for hash, logs := range s.logs {
 		cpy := make([]*types.Log, len(logs))
 		for i, l := range logs {
@@ -710,9 +737,11 @@ func (s *StateDB) Copy() *StateDB {
 		}
 		state.logs[hash] = cpy
 	}
+
 	for hash, preimage := range s.preimages {
 		state.preimages[hash] = preimage
 	}
+
 	// Do we need to copy the access list? In practice: No. At the start of a
 	// transaction, the access list is empty. In practice, we only ever copy state
 	// _between_ transactions/blocks, never in the middle of a transaction.
@@ -726,9 +755,10 @@ func (s *StateDB) Copy() *StateDB {
 	if s.prefetcher != nil {
 		state.prefetcher = s.prefetcher.copy()
 	}
+
 	if s.snaps != nil {
 		// In order for the miner to be able to use and make additions
-		// to the snapshot tree, we need to copy that aswell.
+		// to the snapshot tree, we need to copy that as well.
 		// Otherwise, any block mined by ourselves will cause gaps in the tree,
 		// and force the miner to operate trie-backed only
 		state.snaps = s.snaps
@@ -786,9 +816,31 @@ func (s *StateDB) GetRefund() uint64 {
 // Finalise finalises the state by removing the s destructed objects and clears
 // the journal as well as the refunds. Finalise, however, will not push any updates
 // into the tries just yet. Only IntermediateRoot or Commit will do that.
+// 两个调用来源：
+// 1.每笔交易执行后 applyTransaction() -> StateDB.Finalise()
+// 2.区块中所有交易执行后 BlockChain.writeBlockWithState() -> StateDB.Commit() -> IntermediateRoot() -> Finalise()
+// 其中，前者
+// 对于第二个调用来源，此时应该没有实际作用，因为 journal 此时为空 (以ing)
+// 注意：每执行一笔交易后，都会调用当前函数
+// 功能：遍历 journal 记录的 dirties 账户：
+//   1.调用 obj.finalise() 将 dirtyStorage 写入 pendingStorage
+//   2.更新 stateObjectsPending 和  stateObjectsDirty
+// @param deleteEmptyObjects
+// 参考
+//   [EIP-158: State clearing](https://eips.ethereum.org/EIPS/eip-158)
+//   [EIP-161: State trie clearing (invariant-preserving alternative)](https://eips.ethereum.org/EIPS/eip-161)
+// This removes a large number of empty accounts that have been put in the state at very low cost
+// due to flaws in earlier versions of the Ethereum protocol, thereby greatly reducing state size
+// and hence both reducing the hard disk load of a full client and reducing the time for a fast
+// sync. Additionally, it simplifies the protocol in the long term, as once all “empty” objects
+// are cleared out there is no longer any meaningful distinction between an account being empty
+// and being nonexistent, and indeed one can simply view nonexistence as a compact representation
+// of emptiness.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 	addressesToPrefetch := make([][]byte, 0, len(s.journal.dirties))
-	for addr := range s.journal.dirties { // 更细 journal.dirties，调用 obj.finalise，// 将 dirtyStorage 写入 pendingStorage
+
+	// 遍历 journal.dirties
+	for addr := range s.journal.dirties {
 		obj, exist := s.stateObjects[addr]
 		if !exist {
 			// ripeMD is 'touched' at block 1714175, in tx 0x1237f737031e40bcde4a8b7e717b2d15e3ecadfe49bb1bbc71ee9deb09c6fcf2
@@ -799,6 +851,7 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 			// Thus, we can safely ignore it here
 			continue
 		}
+
 		if obj.suicided || (deleteEmptyObjects && obj.empty()) {
 			obj.deleted = true
 
@@ -812,8 +865,11 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 				delete(s.snapStorage, obj.addrHash)        // Clear out any previously updated storage data (may be recreated via a ressurrect)
 			}
 		} else {
+			// 调用 obj.finalise() 将 dirtyStorage 写入 pendingStorage
 			obj.finalise(true) // Prefetch slots in the background
 		}
+
+		// 将 addr 标记为 pending 和 dirty
 		s.stateObjectsPending[addr] = struct{}{}
 		s.stateObjectsDirty[addr] = struct{}{}
 
@@ -822,24 +878,33 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		// the commit-phase will be a lot faster
 		addressesToPrefetch = append(addressesToPrefetch, common.CopyBytes(addr[:])) // Copy needed for closure
 	}
+
 	if s.prefetcher != nil && len(addressesToPrefetch) > 0 {
 		s.prefetcher.prefetch(s.originalRoot, addressesToPrefetch)
 	}
+
 	// Invalidate journal because reverting across transactions is not allowed.
+	// 清除日志
 	s.clearJournalAndRefund()
 }
 
 // IntermediateRoot computes the current root hash of the state trie.
 // It is called in between transactions to get the root hash that
 // goes into transaction receipts.
-// 计算中间状态的 root hash，这里中间状态 Intermediate 的意思是，同一区块存在多笔交易，
-// applyTransaction() 每执行完一笔交易后都会调用当前函数，得到中间状态的 root hash，
-// 记录在交易对应的收据 Receipt.PostState 中
-// XXX 理解：参考 applyTransaction() 的实现，实际通过 EIP98 去掉了上面的处理，而是仅在
-// 所有交易执行完成后需要提交时，由 StateDB.Commit() 调用 StateDB.IntermediateRoot()
-// 计算最后一笔交易执行后的 root Hash，因此，虽然名字为 Intermediate，但此时其实是最终状态了
+// 功能：计算中间状态的 root hash，这里中间状态 Intermediate 的意思是，同一区块存在多笔交易，
+// applyTransaction() 每执行完一笔交易后都会调用当前函数，得到中间状态的根哈希，记录在交易对
+// 应的收据 Receipt.PostState 中
+//
+// XXX 理解：虽然函数名字为 Intermediate，但此时其实是最终状态了
+// 参考 applyTransaction() 的实现，实际通过 EIP98 去掉了上面的处理，每笔交易执行完成后只调用
+// StateDB.Finalise()，在区块所有交易执行完成后需要提交时，由 BlockChain.writeBlockWithState()
+// -> StateDB.Commit() -> StateDB.IntermediateRoot()，因此函数实现中的 Finalise() 实际没有什么
+// 作用，因为最后一笔交易的 journal 已经被 applyTransaction() -> StateDb.Finalise() 执行后重置.
 func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	// Finalise all the dirty storage states and write them into the tries
+	// 遍历当前交易的 journal 记录的 dirties 账户：
+	// 1.调用 obj.finalise() 将 dirtyStorage 写入 pendingStorage
+	// 2.更新 stateObjectsPending 和 stateObjectsDirty
 	s.Finalise(deleteEmptyObjects)
 
 	// If there was a trie prefetcher operating, it gets aborted and irrevocably
@@ -856,16 +921,21 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.prefetcher = nil
 		}()
 	}
+
 	// Although naively it makes sense to retrieve the account trie and then do
 	// the contract storage and account updates sequentially, that short circuits
 	// the account prefetcher. Instead, let's process all the storage updates
-	// first, giving the account prefeches just a few more milliseconds of time
+	// first, giving the account prefetches just a few more milliseconds of time
 	// to pull useful data from disk.
+
+	// 遍历 stateObjectsPending：调用 obj.updateRoot() 将 obj.pendingStorage 写入 Storage Trie，
+	// 并计算根哈希写入 storageRoot。注意：此时尚未提交到 Database.dirties
 	for addr := range s.stateObjectsPending {
 		if obj := s.stateObjects[addr]; !obj.deleted {
 			obj.updateRoot(s.db)
 		}
 	}
+
 	// Now we're about to start to write changes to the trie. The trie is so far
 	// _untouched_. We can check with the prefetcher, if it can give us a trie
 	// which has the same root, but also has some content loaded into it.
@@ -875,7 +945,8 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		}
 	}
 
-	// 更新 stateTrie 的账户信息(nonce, balance, storageRoot, codeHash)
+	// 上面 updateRoot() 已经重新计算了 account.storageRoot，因此可以确保是最新的
+	// 这里再写入 State Trie 的账户信息 (nonce, balance, storageRoot, codeHash)
 	usedAddrs := make([][]byte, 0, len(s.stateObjectsPending))
 	for addr := range s.stateObjectsPending {
 		if obj := s.stateObjects[addr]; obj.deleted {
@@ -889,16 +960,22 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		// 注释中 closure 的意思 addr 复用同一块内存 (:= range )
 		usedAddrs = append(usedAddrs, common.CopyBytes(addr[:])) // Copy needed for closure
 	}
+
 	if prefetcher != nil {
 		prefetcher.used(s.originalRoot, usedAddrs)
 	}
+
+	// 上面逻辑已经更新 Storage Trie，并进一步写入了 State Trie，因此这里重置 stateObjectsPending
 	if len(s.stateObjectsPending) > 0 {
 		s.stateObjectsPending = make(map[common.Address]struct{})
 	}
+
 	// Track the amount of time wasted on hashing the account trie
 	if metrics.EnabledExpensive {
 		defer func(start time.Time) { s.AccountHashes += time.Since(start) }(time.Now())
 	}
+
+	// 重新计算 State Trie 根哈希
 	return s.trie.Hash()
 }
 
@@ -929,23 +1006,31 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 	if s.dbErr != nil {
 		return common.Hash{}, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
 	}
+
 	// Finalize any pending changes and merge everything into the tries
-	// 首先将 stateObjectsPending 的账户数据，从内存缓存中更新到 State Trie，这里可能会引起 State Trie 结构的变化
+	// 遍历 journal 记录的 dirties 账户：将 dirtyStorage 写入 pendingStorage 并进一步写入 Storage Trie
+	// 以此得到最新的 storageRoot 并将账户写入 State Trie，但不提交 State Trie 本身
+	// 注意这里会引起 State Trie 结构的变化
 	s.IntermediateRoot(deleteEmptyObjects)
 
 	// Commit objects to the trie, measuring the elapsed time
-	// 然后遍历账户，调用 CommitTrie() 更新 Storage Trie，并提交到 db.dirties
 	var storageCommitted int
 	codeWriter := s.db.TrieDB().DiskDB().NewBatch()
+
+	// 然后遍历 stateObjectsDirty，调用 CommitTrie() 更新 Storage Trie，并提交到 Database.dirties
 	for addr := range s.stateObjectsDirty {
 		if obj := s.stateObjects[addr]; !obj.deleted {
 			// Write any contract code associated with the state object
+			// 理解：这里将 codeHash 和对应的 code 实际写入硬盘，而后续修改只提交到 Database.dirties 缓存
+			// 即使 Database 缓存未写入磁盘前节点奔溃，也不会有问题。因为 Trie 树中账户的 codeHash 将是旧值
+			// 指向的是旧的 code，不会获取到这里新写入的 code
 			if obj.code != nil && obj.dirtyCode {
 				rawdb.WriteCode(codeWriter, common.BytesToHash(obj.CodeHash()), obj.code)
 				obj.dirtyCode = false
 			}
+
 			// Write any storage changes in the state object to its storage trie
-			// 提交 storageTrie
+			// 将 Storage Trie 提交到 Database.dirties
 			committed, err := obj.CommitTrie(s.db)
 			if err != nil {
 				return common.Hash{}, err
@@ -954,6 +1039,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		}
 	}
 
+	// 重置 s.stateObjectsDirty
 	if len(s.stateObjectsDirty) > 0 {
 		s.stateObjectsDirty = make(map[common.Address]struct{})
 	}
@@ -974,6 +1060,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 	// for unmarshalling every time.
 	// 最后提交 State Trie，写入 Database.dirties
 	var account types.StateAccount
+
 	// 注意这里 SecureTrie.Commit() 是个同步操作，会坍塌整棵树，并返回根 hash
 	root, accountCommitted, err := s.trie.Commit(func(_ [][]byte, _ []byte, leaf []byte, parent common.Hash) error {
 		// committer.commitLoop() 会判断节点类型进行回调：
@@ -987,14 +1074,16 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 
 		if account.Root != emptyRoot {
 			// 理解：这里引用，要和 Database.deference() 递归解引用结合起来看
-			// 这里是建立 parent 到 storageRoot 指向的树根哈希 的引用
+			// 含义：建立 parent (即 账户叶子节点) 到 storageRoot (即 Storage Trie 根哈希) 的引用
 			s.db.TrieDB().Reference(account.Root, parent)
 		}
 		return nil
 	})
+
 	if err != nil {
 		return common.Hash{}, err
 	}
+
 	if metrics.EnabledExpensive {
 		s.AccountCommits += time.Since(start)
 
@@ -1033,6 +1122,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 
 		s.snap, s.snapDestructs, s.snapAccounts, s.snapStorage = nil, nil, nil, nil
 	}
+
 	return root, err
 }
 

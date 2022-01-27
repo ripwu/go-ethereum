@@ -117,8 +117,10 @@ func (c *committer) commit(n node, db *Database) (node, int, error) {
 
 		// 可以看到，在 insert 之前只有 Key 改成 Compact 编码，Val 是未修改的，因此保持原有的编码
 		// 如果当前节点为叶子节点，Val 原有编码是什么? 感觉理论上要看当前这棵树的类型，但对于 State Trie 或 Storage Trie 的实际使用：
-		// 如果是 State Trie，那么调用入口为 Trie.TryUpdateAccount()，参数为 types.StateAccount 四元组，该函数内部会先调用 rlp.EncodeToBytes 将其转为 []byte
-		// 如果是 Storage Trie，那么调用来源为 stateObject.updateTrie()，该函数在调用 Trie.TryUpdate() 前，会先调用 rlp.EncodeToBytes 将 value 转为 []byte
+		// 1.如果是 State Trie，那么调用入口为 Trie.TryUpdateAccount()，参数为 types.StateAccount 四元组，
+		// 该函数内部会先调用 rlp.EncodeToBytes 将其转为 []byte
+		// 2.如果是 Storage Trie，那么调用来源为 stateObject.updateTrie()，该函数在调用 Trie.TryUpdate() 前，
+		// 会先调用 common.TrimLeftZeroes() 删除 value 前面的 0，再 rlp.EncodeToBytes 将其转为 []byte
 		hashedNode := c.store(collapsed, db)
 		if hn, ok := hashedNode.(hashNode); ok {
 			return hn, childCommitted + 1, nil

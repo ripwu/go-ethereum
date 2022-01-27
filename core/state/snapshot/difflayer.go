@@ -111,7 +111,9 @@ type diffLayer struct {
 
 	root  common.Hash // Root hash to which this snapshot diff belongs to
 
-	// 正常来说，在 diffToDisk() 中被设置为 true，表示 diffLayer 数据已经写入 diskLayer
+	// TODO 理解这里并发的需要，与 diskLayer.stale bool 比较
+	// 这里用 uint32 而非 bool 类型，感觉是为了使用 atomic.Load/Swap/Store
+	// 调用来源：diffLayer.flatten() 或 Tree.Disable() 或 Tree.Rebuild()
 	stale uint32      // Signals that the layer became stale (state progressed)
 
 	// destructSet is a very special helper marker. If an account is marked as
@@ -478,7 +480,7 @@ func (dl *diffLayer) Update(blockRoot common.Hash, destructs map[common.Hash]str
 // the flattening builds up from there in reverse.
 // 调用来源：Tree.Cap() / Tree.cap()
 //
-// 递归合并多层 diffLayer，最终得到一层 diffLayer
+// 递归向下合并多层 diffLayer，最终得到新的 bottom diffLayer
 // 1.将 diffLayer1 合并到 diffLayer0，得到 diffLayerNew0
 // 2.将 diffLayer2 合并到 diffLayerNew0，得到 diffLayerNew1
 // 3.将 diffLayer3 合并到 diffLayerNew1，得到 diffLayerNew2
@@ -510,6 +512,7 @@ func (dl *diffLayer) flatten() snapshot {
 
 	// Before actually writing all our data to the parent, first ensure that the
 	// parent hasn't been 'corrupted' by someone else already flattening into it
+	// 注意这里会将当前层的 stale 从 0 设置为 1
 	if atomic.SwapUint32(&parent.stale, 1) != 0 {
 		panic("parent diff layer is stale") // we've flattened into the same parent from two children, boo
 	}

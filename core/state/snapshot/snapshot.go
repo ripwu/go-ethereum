@@ -600,7 +600,7 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 	bottom.lock.RLock()
 
 	// 将 bottom diffLayer 写入 diskLayer，得到新构建的 diskLayer
-	// diffToDisk() 会将 bottom.stale 修改为 true，表示 bottom 已经失效
+	// diffToDisk() 会将旧的 diskLayer.stale 修改为 true，表示已经失效
 	base := diffToDisk(bottom)
 
 	bottom.lock.RUnlock()
@@ -647,7 +647,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		panic("parent disk layer is stale") // we've committed into the same base from two children, boo
 	}
 
-	// 将 base.stale 设置为 true
+	// 将旧的 diskLayer.stale 设置为 true
 	base.stale = true
 	base.lock.Unlock()
 
@@ -662,6 +662,8 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		// Remove all storage slots
 		// 删除账户的 State Trie 节点
 		rawdb.DeleteAccountSnapshot(batch, hash)
+
+		// 这里是 Set 不是 Del，缓存中仍有这个 account
 		base.cache.Set(hash[:], nil)
 
 		// 遍历删除账户的 Storage Trie

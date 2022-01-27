@@ -96,6 +96,7 @@ type Trie interface {
 
 	// NodeIterator returns an iterator that returns nodes of the trie. Iteration
 	// starts at the key after the given start key.
+	// 顺序：先序遍历
 	NodeIterator(startKey []byte) trie.NodeIterator
 
 	// Prove constructs a Merkle proof for key. The result contains all encoded nodes

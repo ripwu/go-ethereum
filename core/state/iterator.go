@@ -92,6 +92,7 @@ func (it *NodeIterator) step() error {
 		it.code = nil
 		return nil
 	}
+
 	// Step to the next state trie node, terminating if we're out of nodes
 	if cont := it.stateIt.Next(true); !cont {
 		if it.stateIt.Error() != nil {
@@ -100,10 +101,12 @@ func (it *NodeIterator) step() error {
 		it.state, it.stateIt = nil, nil
 		return nil
 	}
+
 	// If the state trie node is an internal entry, leave as is
 	if !it.stateIt.Leaf() {
 		return nil
 	}
+
 	// Otherwise we've reached an account node, initiate data iteration
 	var account types.StateAccount
 	if err := rlp.Decode(bytes.NewReader(it.stateIt.LeafBlob()), &account); err != nil {
@@ -113,10 +116,12 @@ func (it *NodeIterator) step() error {
 	if err != nil {
 		return err
 	}
+
 	it.dataIt = dataTrie.NodeIterator(nil)
 	if !it.dataIt.Next(true) {
 		it.dataIt = nil
 	}
+
 	if !bytes.Equal(account.CodeHash, emptyCodeHash) {
 		it.codeHash = common.BytesToHash(account.CodeHash)
 		addrHash := common.BytesToHash(it.stateIt.LeafKey())
@@ -125,6 +130,7 @@ func (it *NodeIterator) step() error {
 			return fmt.Errorf("code %x: %v", account.CodeHash, err)
 		}
 	}
+
 	it.accountHash = it.stateIt.Parent()
 	return nil
 }

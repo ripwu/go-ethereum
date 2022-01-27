@@ -107,11 +107,12 @@ func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainCon
 	var root []byte
 
 	// 参考
-	// https://github.com/ethereum/EIPs/issues/98
+	// [EIP-658: Embedding transaction status code in receipts](https://eips.ethereum.org/EIPS/eip-658)
 	// [Understanding Byzantium & What it Represents to the Ethereum Network](https://medium.com/digitalassetresearch/understanding-byzantium-what-it-represents-to-the-ethereum-network-9de3d00d552a)
 	// [What Is the Byzantium Hard Fork In Ethereum?](https://www.investopedia.com/news/what-byzantium-hard-fork-ethereum/)
 	// 不再通过 PostState 记录每笔交易执行后的中间 root hash，而是仅记录成功或失败 receipt.Status
-	// (TODO 理解：看文档，似乎是并发执行交易的需要，如果记录 PostState，则交易只能串行执行)
+	// 优点：1.减少计算(多笔交易可能修改相同 account/slot，因此只需计算最后一次) 2.为后续可能升级的交易并发计算铺垫?
+	// 缺点：不再能验证区块中哪一笔交易出错
 	if config.IsByzantium(blockNumber) {
 		statedb.Finalise(true)
 	} else {
