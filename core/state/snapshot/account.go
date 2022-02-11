@@ -24,6 +24,9 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
+// SlimAccount 对于 EOA 地址，Root 和 CodeHash 为 nil；其 rlp 编码较为精简
+// FullAccount 对于 EOA 地址，Root 为 emptyRoot，CodeHash 为 emptyCode
+
 // Account is a modified version of a state.Account, where the root is replaced
 // with a byte slice. This format can be used to represent full-consensus format
 // or slim-snapshot format which replaces the empty root and code hash as nil

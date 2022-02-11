@@ -138,6 +138,7 @@ func mustDecodeNode(hash, buf []byte) node {
 }
 
 // decodeNode parses the RLP encoding of a trie node.
+// 解码当前节点，不会递归
 func decodeNode(hash, buf []byte) (node, error) {
 	if len(buf) == 0 {
 		return nil, io.ErrUnexpectedEOF
@@ -158,6 +159,7 @@ func decodeNode(hash, buf []byte) (node, error) {
 	}
 }
 
+// 解码当前节点，不会递归
 func decodeShort(hash, elems []byte) (node, error) {
 	kbuf, rest, err := rlp.SplitString(elems)
 	if err != nil {

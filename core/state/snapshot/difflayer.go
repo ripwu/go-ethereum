@@ -33,6 +33,7 @@ import (
 
 var (
 	// TODO 参考 Dynamic state snapshots #20152 中 holiman 的估算
+	// [Dynamic state snapshots #20152](https://github.com/ethereum/go-ethereum/pull/20152)
 
 	// aggregatorMemoryLimit is the maximum size of the bottom-most diff layer
 	// that aggregates the writes from above until it's flushed into the disk

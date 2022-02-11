@@ -90,14 +90,14 @@ type StateDB struct {
 
 	// 参考 stateObject 中的注释说明
 
-	// 当前区块累计修改的账户
+	// 当前区块累计修改的账户  (未提交到 Trie)
 	// 1.写入：每笔交易执行后 applyTransaction() -> StateDB.Finalise() -> obj.finalise()
 	//        将 dirtyStorage 写入 pendingStorage
 	// 2.重置：区块所有交易执行后 BlockChain.writeBlockWithState() -> StateDB.Commit() -> IntermediateRoot() -> obj.updateTrie()
 	//        将 pendingStorage 写入 originStorage，并提交到 Storage Trie
 	stateObjectsPending map[common.Address]struct{} // State objects finalized but not yet written to the trie
 
-	// TODO 注释 in the current execution 感觉不准确
+	// XXX in the current execution 注释不准确，实际是当前区块累计修改的账户 (未提交到 Database)
 	// 当前区块累计修改的账户
 	// 1.写入：每笔交易执行后 applyTransaction() -> StateDB.Finalise() -> finalise()
 	//        将 dirtyStorage 写入 pendingStorage

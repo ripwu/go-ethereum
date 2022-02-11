@@ -39,6 +39,15 @@ import (
 )
 
 var (
+	// TODO 理解
+	// [Dynamic state snapshots #20152](https://github.com/ethereum/go-ethereum/pull/20152)
+	//   The PR achieves this by gradually iterating the state tries and maintaining a marker to the account/storage slot position until which the snapshot was already generated. Every time a new block is executed, state mutations prior to the marker get applied directly (the ones afterwards get discarded) and the snapshot builder switches to iterating the new root hash.
+	// [More efficient snap](https://notes.ethereum.org/o6WHX_QRSoG4N4D9toAktg)
+	// [Snapshot generation proposal](https://gist.github.com/rjl493456442/85832a0c760f2bafe2a69e33efe68c60)
+	// [core/state/snapshot: faster snapshot generation #22504](https://github.com/ethereum/go-ethereum/pull/22504)
+	// [core/state/snapshot: less disk reads #6](https://github.com/rjl493456442/go-ethereum/pull/6)
+	// [core/state/snapshot: reuse memory data instead of hitting disk when generating #22667](https://github.com/ethereum/go-ethereum/pull/22667)
+
 	// emptyRoot is the known root hash of an empty trie.
 	emptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
@@ -103,13 +112,14 @@ type generatorStats struct {
 	storage  common.StorageSize // Total account and storage slot size(generation or recovery)
 }
 
-// Log creates an contextual log with the given message and the context pulled
+// Log creates a contextual log with the given message and the context pulled
 // from the internally maintained statistics.
 func (gs *generatorStats) Log(msg string, root common.Hash, marker []byte) {
 	var ctx []interface{}
 	if root != (common.Hash{}) {
 		ctx = append(ctx, []interface{}{"root", root}...)
 	}
+
 	// Figure out whether we're after or within an account
 	switch len(marker) {
 	case common.HashLength:
@@ -120,6 +130,7 @@ func (gs *generatorStats) Log(msg string, root common.Hash, marker []byte) {
 			"at", common.BytesToHash(marker[common.HashLength:]),
 		}...)
 	}
+
 	// Add the usual measurements
 	ctx = append(ctx, []interface{}{
 		"accounts", gs.accounts,
@@ -127,6 +138,7 @@ func (gs *generatorStats) Log(msg string, root common.Hash, marker []byte) {
 		"storage", gs.storage,
 		"elapsed", common.PrettyDuration(time.Since(gs.start)),
 	}...)
+
 	// Calculate the estimated indexing time based on current stats
 	if len(marker) > 0 {
 		if done := binary.BigEndian.Uint64(marker[:8]) - gs.origin; done > 0 {
@@ -144,8 +156,8 @@ func (gs *generatorStats) Log(msg string, root common.Hash, marker []byte) {
 // generateSnapshot regenerates a brand new snapshot based on an existing state
 // database and head block asynchronously. The snapshot is returned immediately
 // and generation is continued in the background until done.
-// 基于已有的 State database 和 head block 异步创建 snapshot
-// snapshot 马上返回，在后台执行生成过程
+// 基于已有的 diskdb (State/Storage Trie) 和 head block root 异步创建 snapshot
+// 其中，snapshot 马上返回，内部数据由后台线程异步填充
 func generateSnapshot(diskdb ethdb.KeyValueStore, triedb *trie.Database, cache int, root common.Hash) *diskLayer {
 	// Create a new disk layer with an initialized state marker at zero
 	var (
@@ -159,6 +171,7 @@ func generateSnapshot(diskdb ethdb.KeyValueStore, triedb *trie.Database, cache i
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to write initialized state marker", "err", err)
 	}
+
 	base := &diskLayer{
 		diskdb:     diskdb,
 		triedb:     triedb,
@@ -170,6 +183,7 @@ func generateSnapshot(diskdb ethdb.KeyValueStore, triedb *trie.Database, cache i
 	}
 
 	go base.generate(stats)
+
 	log.Debug("Start snapshot generation", "root", root)
 	return base
 }
@@ -212,10 +226,14 @@ func journalProgress(db ethdb.KeyValueWriter, marker []byte, stats *generatorSta
 type proofResult struct {
 	keys     [][]byte   // The key set of all elements being iterated, even proving is failed
 	vals     [][]byte   // The val set of all elements being iterated, even proving is failed
+
+	// diskdb 数据是否已全部迭代
 	diskMore bool       // Set when the database has extra snapshot states since last iteration
+
+	// trie 是否已全部迭代
 	trieMore bool       // Set when the trie has extra snapshot states(only meaningful for successful proving)
 	proofErr error      // Indicator whether the given state range is valid or not
-	tr       *trie.Trie // The trie, in case the trie was resolved by the prover (may be nil)
+	tr       *trie.Trie // The trie, in case the trie was resolved by the prover (maybe nil)
 }
 
 // valid returns the indicator that range proof is successful or not.
@@ -252,6 +270,8 @@ func (result *proofResult) forEach(callback func(key []byte, val []byte) error) 
 //
 // The proof result will be returned if the range proving is finished, otherwise
 // the error will be returned to abort the entire procedure.
+// 功能：验证 diskdb 中一段数据符合 triedb 中的数据，其中 diskdb 以 KV 形式记录着两层 Trie 所有叶子节点
+// @return error 只在 root 无法从 dl.triedb 找到时返回 errMissingTrie
 func (dl *diskLayer) proveRange(stats *generatorStats, root common.Hash, prefix []byte, kind string, origin []byte, max int, valueConvertFn func([]byte) ([]byte, error)) (*proofResult, error) {
 	var (
 		keys     [][]byte
@@ -259,21 +279,27 @@ func (dl *diskLayer) proveRange(stats *generatorStats, root common.Hash, prefix 
 		proof    = rawdb.NewMemoryDatabase()
 		diskMore = false
 	)
+
+	// 1.从 diskdb 初始化迭代器，目标为以 prefix 开始的数据项的集合；初始指向 origin (可能不存在)
 	iter := dl.diskdb.NewIterator(prefix, origin)
 	defer iter.Release()
 
+	// 2.遍历迭代器 max 次直到结束，收集数据项；索引 和 值 分别记录在 keys 和 vals
 	var start = time.Now()
 	for iter.Next() {
 		key := iter.Key()
 		if len(key) != len(prefix)+common.HashLength {
 			continue
 		}
+
 		if len(keys) == max {
 			// Break if we've reached the max size, and signal that we're not
 			// done yet.
 			diskMore = true
 			break
 		}
+
+		// 这里恢复为原来的 keys
 		keys = append(keys, common.CopyBytes(key[len(prefix):]))
 
 		if valueConvertFn == nil {
@@ -294,12 +320,14 @@ func (dl *diskLayer) proveRange(stats *generatorStats, root common.Hash, prefix 
 			}
 		}
 	}
+
 	// Update metrics for database iteration and merkle proving
 	if kind == "storage" {
 		snapStorageSnapReadCounter.Inc(time.Since(start).Nanoseconds())
 	} else {
 		snapAccountSnapReadCounter.Inc(time.Since(start).Nanoseconds())
 	}
+
 	defer func(start time.Time) {
 		if kind == "storage" {
 			snapStorageProveCounter.Inc(time.Since(start).Nanoseconds())
@@ -314,6 +342,7 @@ func (dl *diskLayer) proveRange(stats *generatorStats, root common.Hash, prefix 
 		for i, key := range keys {
 			stackTr.TryUpdate(key, vals[i])
 		}
+
 		if gotRoot := stackTr.Hash(); gotRoot != root {
 			return &proofResult{
 				keys:     keys,
@@ -321,23 +350,32 @@ func (dl *diskLayer) proveRange(stats *generatorStats, root common.Hash, prefix 
 				proofErr: fmt.Errorf("wrong root: have %#x want %#x", gotRoot, root),
 			}, nil
 		}
+
 		return &proofResult{keys: keys, vals: vals}, nil
 	}
+
+	// 3.通过 dl.triedb 和 root，构建 Trie
 	// Snap state is chunked, generate edge proofs for verification.
 	tr, err := trie.New(root, dl.triedb)
 	if err != nil {
 		stats.Log("Trie missing, state snapshotting paused", dl.root, dl.genMarker)
 		return nil, errMissingTrie
 	}
+
+	// keys 单调递增，range 最大为 max；取 origin 和 last 作为范围两边的 edge，分别生成 proof
+
 	// Firstly find out the key of last iterated element.
 	var last []byte
 	if len(keys) > 0 {
 		last = keys[len(keys)-1]
 	}
+
 	// Generate the Merkle proofs for the first and last element
 	if origin == nil {
 		origin = common.Hash{}.Bytes()
 	}
+
+	// 4.1.通过步骤 3 构造的 trie，生成 root 到 origin 的路径的证明，记录在 proof
 	if err := tr.Prove(origin, 0, proof); err != nil {
 		log.Debug("Failed to prove range", "kind", kind, "origin", origin, "err", err)
 		return &proofResult{
@@ -348,6 +386,8 @@ func (dl *diskLayer) proveRange(stats *generatorStats, root common.Hash, prefix 
 			tr:       tr,
 		}, nil
 	}
+
+	// 4.2.通过步骤 3 构造的 trie，生成 root 到 last 的路径的证明，记录在 proof
 	if last != nil {
 		if err := tr.Prove(last, 0, proof); err != nil {
 			log.Debug("Failed to prove range", "kind", kind, "last", last, "err", err)
@@ -360,6 +400,8 @@ func (dl *diskLayer) proveRange(stats *generatorStats, root common.Hash, prefix 
 			}, nil
 		}
 	}
+
+	// 5.验证从 origin 到 last 的所有数据 (keys 和 vals)，符合 proof
 	// Verify the snapshot segment with range prover, ensure that all flat states
 	// in this range correspond to merkle trie.
 	cont, err := trie.VerifyRangeProof(root, origin, last, keys, vals, proof)
@@ -391,6 +433,7 @@ func (dl *diskLayer) generateRange(root common.Hash, prefix []byte, kind string,
 	if err != nil {
 		return false, nil, err
 	}
+
 	last := result.last()
 
 	// Construct contextual logger
@@ -401,7 +444,7 @@ func (dl *diskLayer) generateRange(root common.Hash, prefix []byte, kind string,
 	logger := log.New(logCtx...)
 
 	// The range prover says the range is correct, skip trie iteration
-	if result.valid() {
+	if result.valid() { // 验证通过
 		snapSuccessfulRangeProofMeter.Mark(1)
 		logger.Trace("Proved state range", "last", hexutil.Encode(last))
 
@@ -411,9 +454,16 @@ func (dl *diskLayer) generateRange(root common.Hash, prefix []byte, kind string,
 		if err := result.forEach(func(key []byte, val []byte) error { return onState(key, val, false, false) }); err != nil {
 			return false, nil, err
 		}
+
 		// Only abort the iteration when both database and trie are exhausted
 		return !result.diskMore && !result.trieMore, last, nil
 	}
+
+	// 注意：执行到这里，说明 result.proofErr 存在失败；此时需要判断 kvkeys[0] 路径，分情况回调：
+	// triedb 中不存在路径：onState(kvkeys[0], nil, write: false, delete: true)
+	// triedb 中存在路径，但节点 value 变化：onState(iter.Key, iter.Value, write: true,  delete: false)
+	// triedb 中存在路径，且节点 value 相同：onState(iter.Key, iter.Value, write: false, delete: false)
+
 	logger.Trace("Detected outdated state range", "last", hexutil.Encode(last), "err", result.proofErr)
 	snapFailedRangeProofMeter.Mark(1)
 
@@ -433,6 +483,12 @@ func (dl *diskLayer) generateRange(root common.Hash, prefix []byte, kind string,
 	// We use the snap data to build up a cache which can be used by the
 	// main account trie as a primary lookup when resolving hashes
 	var snapNodeCache ethdb.KeyValueStore
+
+	// 以 diskdb 的 snap 数据 keys 和 vals 构造 snapNodeCache；参考
+	// core/state/snapshot: reuse memory data instead of hitting disk when generating #22667
+	// https://github.com/ethereum/go-ethereum/pull/22667
+	// core/state/snapshot: less disk reads #6
+	// https://github.com/rjl493456442/go-ethereum/pull/6
 	if len(result.keys) > 0 {
 		snapNodeCache = memorydb.New()
 		snapTrieDb := trie.NewDatabase(snapNodeCache)
@@ -440,9 +496,12 @@ func (dl *diskLayer) generateRange(root common.Hash, prefix []byte, kind string,
 		for i, key := range result.keys {
 			snapTrie.Update(key, result.vals[i])
 		}
+
+		// 写入 snapNodeCache
 		root, _, _ := snapTrie.Commit(nil)
 		snapTrieDb.Commit(root, false, nil)
 	}
+
 	tr := result.tr
 	if tr == nil {
 		tr, err = trie.New(root, dl.triedb)
@@ -469,49 +528,75 @@ func (dl *diskLayer) generateRange(root common.Hash, prefix []byte, kind string,
 		start    = time.Now()
 		internal time.Duration
 	)
+
 	nodeIt.AddResolver(snapNodeCache)
+
+	// 遍历迭代器，直到迭代完成
 	for iter.Next() {
+		// 或者迭代到第一个比 last 大的节点
 		if last != nil && bytes.Compare(iter.Key, last) > 0 {
 			trieMore = true
 			break
 		}
+
 		count++
 		write := true
 		created++
+
 		for len(kvkeys) > 0 {
 			if cmp := bytes.Compare(kvkeys[0], iter.Key); cmp < 0 {
+				// kvkeys[0] 路径不存在，将其从 diskdb 中删除
+
 				// delete the key
 				istart := time.Now()
 				if err := onState(kvkeys[0], nil, false, true); err != nil {
 					return false, nil, err
 				}
+
 				kvkeys = kvkeys[1:]
 				kvvals = kvvals[1:]
+
+				// TODO 不需要 create-- ?
 				deleted++
 				internal += time.Since(istart)
+
+				// 继续下一个 kvkeys
 				continue
 			} else if cmp == 0 {
+				// kvkeys[0] 路径存在
 				// the snapshot key can be overwritten
 				created--
+
+				//  value 如果不同，设置 write 为 true，否则为 false
 				if write = !bytes.Equal(kvvals[0], iter.Value); write {
 					updated++
 				} else {
 					untouched++
 				}
+
 				kvkeys = kvkeys[1:]
 				kvvals = kvvals[1:]
 			}
+
+			// Compare(kvkeys[0], iter.Key) >= 0 时跳出循环：
+			// > 0 时，write 为默认值 true，kvkeys 不变
+			// == 0 时，write 取决于 value 是否不同，kvkeys 指向下一个
 			break
 		}
+
+		// 将 迭代器 指向的 当前节点 写入 diskdb
 		istart := time.Now()
 		if err := onState(iter.Key, iter.Value, write, false); err != nil {
 			return false, nil, err
 		}
+
 		internal += time.Since(istart)
 	}
+
 	if iter.Err != nil {
 		return false, nil, iter.Err
 	}
+
 	// Delete all stale snapshot states remaining
 	istart := time.Now()
 	for _, key := range kvkeys {
@@ -540,6 +625,7 @@ func (dl *diskLayer) generateRange(root common.Hash, prefix []byte, kind string,
 // constructing the state snapshot. All the arguments are purely for statistics
 // gathering and logging, since the method surfs the blocks as they arrive, often
 // being restarted.
+// 根据 diskLayer.triedb 生成 KV 数据 (account / account + storage) 写入 dl.diskdb
 func (dl *diskLayer) generate(stats *generatorStats) {
 	var (
 		accMarker    []byte
@@ -563,6 +649,7 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 		case abort = <-dl.genAbort:
 		default:
 		}
+
 		if batch.ValueSize() > ethdb.IdealBatchSize || abort != nil {
 			if bytes.Compare(currentLocation, dl.genMarker) < 0 {
 				log.Error("Snapshot generator went backwards",
@@ -589,10 +676,12 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 				return errors.New("aborted")
 			}
 		}
+
 		if time.Since(logged) > 8*time.Second {
 			stats.Log("Generating state snapshot", dl.root, currentLocation)
 			logged = time.Now()
 		}
+
 		return nil
 	}
 
@@ -601,6 +690,7 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 			start       = time.Now()
 			accountHash = common.BytesToHash(key)
 		)
+
 		if delete {
 			rawdb.DeleteAccountSnapshot(batch, accountHash)
 			snapWipedAccountMeter.Mark(1)
@@ -611,9 +701,11 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 			if err := wipeKeyRange(dl.diskdb, "storage", prefix, nil, nil, keyLen, snapWipedStorageMeter, false); err != nil {
 				return err
 			}
+
 			snapAccountWriteCounter.Inc(time.Since(start).Nanoseconds())
 			return nil
 		}
+
 		// Retrieve the current account and flatten it into the internal format
 		var acc struct {
 			Nonce    uint64
@@ -621,9 +713,11 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 			Root     common.Hash
 			CodeHash []byte
 		}
+
 		if err := rlp.DecodeBytes(val, &acc); err != nil {
 			log.Crit("Invalid account encountered during snapshot creation", "err", err)
 		}
+
 		// If the account is not yet in-progress, write it out
 		if accMarker == nil || !bytes.Equal(accountHash[:], accMarker) {
 			dataLen := len(val) // Approximate size, saves us a round of RLP-encoding
@@ -641,22 +735,30 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 				rawdb.WriteAccountSnapshot(batch, accountHash, data)
 				snapGeneratedAccountMeter.Mark(1)
 			}
+
 			stats.storage += common.StorageSize(1 + common.HashLength + dataLen)
 			stats.accounts++
 		}
+
 		marker := accountHash[:]
+
 		// If the snap generation goes here after interrupted, genMarker may go backward
 		// when last genMarker is consisted of accountHash and storageHash
 		if accMarker != nil && bytes.Equal(marker, accMarker) && len(dl.genMarker) > common.HashLength {
 			marker = dl.genMarker[:]
 		}
+
 		// If we've exceeded our batch allowance or termination was requested, flush to disk
 		if err := checkAndFlush(marker); err != nil {
 			return err
 		}
+
 		// If the iterated account is the contract, create a further loop to
 		// verify or regenerate the contract storage.
 		if acc.Root == emptyRoot {
+			// 如果 storageRoot 为 emptyRoot，无法确定 acc 是 EOA 还是智能合约
+			// 因此调用 wipeKeyRange() 强制从 diskdb 中找到并删除 Storage Trie 叶子节点
+
 			// If the root is empty, we still need to ensure that any previous snapshot
 			// storage values are cleared
 			// TODO: investigate if this can be avoided, this will be very costly since it
@@ -669,12 +771,14 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 			}
 			snapAccountWriteCounter.Inc(time.Since(start).Nanoseconds())
 		} else {
+			// 否则，acc 是 智能合约，需要遍历 Storage Trie 生成 snapshot
 			snapAccountWriteCounter.Inc(time.Since(start).Nanoseconds())
 
 			var storeMarker []byte
 			if accMarker != nil && bytes.Equal(accountHash[:], accMarker) && len(dl.genMarker) > common.HashLength {
 				storeMarker = dl.genMarker[common.HashLength:]
 			}
+
 			onStorage := func(key []byte, val []byte, write bool, delete bool) error {
 				defer func(start time.Time) {
 					snapStorageWriteCounter.Inc(time.Since(start).Nanoseconds())
@@ -685,12 +789,14 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 					snapWipedStorageMeter.Mark(1)
 					return nil
 				}
+
 				if write {
 					rawdb.WriteStorageSnapshot(batch, accountHash, common.BytesToHash(key), val)
 					snapGeneratedStorageMeter.Mark(1)
 				} else {
 					snapRecoveredStorageMeter.Mark(1)
 				}
+
 				stats.storage += common.StorageSize(1 + 2*common.HashLength + len(val))
 				stats.slots++
 
@@ -700,8 +806,10 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 				}
 				return nil
 			}
+
 			var storeOrigin = common.CopyBytes(storeMarker)
 			for {
+				// 分段遍历 Storage Trie (acc.Root)
 				exhausted, last, err := dl.generateRange(acc.Root, append(rawdb.SnapshotStoragePrefix, accountHash.Bytes()...), "storage", storeOrigin, storageCheckRange, stats, onStorage, nil)
 				if err != nil {
 					return err
@@ -714,31 +822,39 @@ func (dl *diskLayer) generate(stats *generatorStats) {
 				}
 			}
 		}
+
 		// Some account processed, unmark the marker
 		accMarker = nil
 		return nil
 	}
 
-	// Global loop for regerating the entire state trie + all layered storage tries.
+	// Global loop for regenerating the entire state trie + all layered storage tries.
 	for {
+		// 分段遍历对应的 State Trie
 		exhausted, last, err := dl.generateRange(dl.root, rawdb.SnapshotAccountPrefix, "account", accOrigin, accountRange, stats, onAccount, FullAccountRLP)
+
 		// The procedure it aborted, either by external signal or internal error
 		if err != nil {
 			if abort == nil { // aborted by internal error, wait the signal
 				abort = <-dl.genAbort
 			}
+
 			abort <- stats
 			return
 		}
+
 		// Abort the procedure if the entire snapshot is generated
 		if exhausted {
 			break
 		}
+
 		if accOrigin = increaseKey(last); accOrigin == nil {
 			break // special case, the last is 0xffffffff...fff
 		}
+
 		accountRange = accountCheckRange
 	}
+
 	// Snapshot fully generated, set the marker to nil.
 	// Note even there is nothing to commit, persist the
 	// generator anyway to mark the snapshot is complete.

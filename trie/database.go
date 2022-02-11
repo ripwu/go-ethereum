@@ -334,6 +334,11 @@ func NewDatabaseWithConfig(diskdb ethdb.KeyValueStore, config *Config) *Database
 		dirties: map[common.Hash]*cachedNode{{}: {
 			children: make(map[common.Hash]uint16),
 		}},
+
+		// ==
+		//dirties: map[common.Hash]*cachedNode{common.Hash{}: &cachedNode{
+		//	children: make(map[common.Hash]uint16),
+		//}},
 	}
 	if config == nil || config.Preimages { // TODO(karalabe): Flip to default off in the future
 		db.preimages = make(map[common.Hash][]byte)
@@ -420,6 +425,7 @@ func (db *Database) node(hash common.Hash) node {
 			return mustDecodeNode(hash[:], enc)
 		}
 	}
+
 	// Retrieve the node from the dirty cache if available
 	db.lock.RLock()
 	dirty := db.dirties[hash]

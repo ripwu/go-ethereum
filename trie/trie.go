@@ -554,7 +554,7 @@ func (t *Trie) Hash() common.Hash {
 	// hash 是整棵树不断自底向上坍缩得到的 hashNode
 	hash, cached, _ := t.hashRoot()
 
-	// cached 是递归过程中新构建的一颗树，树结构与原来的 t.root 完全一致
+	// cached 是递归过程中新构建的一棵树，树结构与原来的 t.root 完全一致
 	// 唯一的区别在于每个 node的 nodeFlags 记录了自己子树计算出来的 hash
 	// 注意：cached.nodeFlags.dirty 不一定为 true
 	// 因为有点节点是从 db 中加载后展开的，如果子树未修改，那么它下面的节点是干净的，dirty 为 false

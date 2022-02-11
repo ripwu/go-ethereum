@@ -634,7 +634,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 	if base.genAbort != nil {
 		abort := make(chan *generatorStats)
 		base.genAbort <- abort
-		stats = <-abort
+		stats = <-abort // 阻塞等待
 	}
 
 	// 删除数据库中此前保存的 snapshot 根节点
@@ -689,7 +689,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 	}
 
 	// Push all updated accounts into the database
-	// 写入 State Trie
+	// 将 account 数据从 bottom.accountData 写入 State Trie
 	for hash, data := range bottom.accountData {
 		// Skip any account not covered yet by the snapshot
 		if base.genMarker != nil && bytes.Compare(hash[:], base.genMarker) > 0 {
@@ -744,7 +744,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		}
 	}
 
-	// 向数据库写入 snapshot 新的根节点 bottom.root
+	// 向底层数据库写入 snapshot 新的根节点 bottom.root
 	// Update the snapshot block marker and write any remainder data
 	rawdb.WriteSnapshotRoot(batch, bottom.root)
 
@@ -772,6 +772,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		genPending: base.genPending,
 	}
 
+	// 启动新的协程，继续此前的生成
 	// If snapshot generation hasn't finished yet, port over all the starts and
 	// continue where the previous round left off.
 	//
@@ -782,6 +783,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		res.genAbort = make(chan chan *generatorStats)
 		go res.generate(stats)
 	}
+
 	return res
 }
 
@@ -876,6 +878,7 @@ func (t *Tree) Rebuild(root common.Hash) {
 			panic(fmt.Sprintf("unknown layer type: %T", layer))
 		}
 	}
+
 	// Start generating a new snapshot from scratch on a background thread. The
 	// generator will run a wiper first if there's not one running right now.
 	log.Info("Rebuilding state snapshot")

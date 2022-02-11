@@ -32,7 +32,7 @@ import (
 type diskLayer struct {
 	diskdb ethdb.KeyValueStore // Key-value store containing the base snapshot
 
-	// TODO 具体怎样使用
+	// 用途：在 Tree.generate() 进行 range prove 时构造 Trie 树用于 resolveHash
 	triedb *trie.Database      // Trie node cache for reconstruction purposes
 
 	cache  *fastcache.Cache    // Cache to avoid hitting the disk for direct access
@@ -47,6 +47,7 @@ type diskLayer struct {
 	genPending chan struct{}             // Notification channel when generation is done (test synchronicity)
 	genAbort   chan chan *generatorStats // Notification channel to abort generating the snapshot in this layer
 
+	// 粒度：看起来是为了控制整个结构体的并发访问，不限定某些成员
 	lock sync.RWMutex
 }
 
@@ -101,7 +102,7 @@ func (dl *diskLayer) AccountRLP(hash common.Hash) ([]byte, error) {
 	// If the layer is being generated, ensure the requested hash has already been
 	// covered by the generator.
 	// 从这里看起来，snapshot 是对 Account 的 Hashes 做了从小到大排序处理的，genMarker 表示处理到哪个 Account Hash
-	// bytes.Compare() > 0 的意思是，还没处理到 hash[:]
+	// bytes.Compare(hash[:], dl.genMarker) > 0 的意思是，还没处理到 hash[:]
 	if dl.genMarker != nil && bytes.Compare(hash[:], dl.genMarker) > 0 {
 		return nil, ErrNotCoveredYet
 	}
@@ -115,6 +116,7 @@ func (dl *diskLayer) AccountRLP(hash common.Hash) ([]byte, error) {
 		snapshotCleanAccountReadMeter.Mark(int64(len(blob)))
 		return blob, nil
 	}
+
 	// Cache doesn't contain account, pull from disk and cache for later
 	blob := rawdb.ReadAccountSnapshot(dl.diskdb, hash)
 	dl.cache.Set(hash[:], blob)
@@ -142,6 +144,7 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 
 	key := append(accountHash[:], storageHash[:]...)
 
+	// 如果底层数据还在生成中，要求 key 小于 genMarker，否则返回错误
 	// If the layer is being generated, ensure the requested hash has already been
 	// covered by the generator.
 	if dl.genMarker != nil && bytes.Compare(key, dl.genMarker) > 0 {

@@ -98,7 +98,7 @@ func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 		}
 		return hashed, cached
 	default:
-		// Value and hash nodes don't have children so they're left as were
+		// Value and hash nodes don't have children, so they're left as were
 		return n, n
 	}
 }
@@ -107,28 +107,31 @@ func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 // holds a live reference to the Key, and must not be modified.
 // The cached
 // @return collapsed 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 为 Compact 编码；
-//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
+//   如果原来的 Val 为 分支节点 和 扩展节点，Val 将变为 hashNode
 // @return cached 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 保持 HEX 编码不变；
-//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
+//   如果原来的 Val 为 分支节点 和 扩展节点，Val 不变，flags.hash 将记录当前子树 n 的 merkle tree
 func (h *hasher) hashShortNodeChildren(n *shortNode) (collapsed, cached *shortNode) {
 	// Hash the short node's child, caching the newly hashed subtree
 	collapsed, cached = n.copy(), n.copy()
+
 	// Previously, we did copy this one. We don't seem to need to actually
 	// do that, since we don't overwrite/reuse keys
 	//cached.Key = common.CopyBytes(n.Key)
 	collapsed.Key = hexToCompact(n.Key)
+
 	// Unless the child is a valuenode or hashnode, hash it
 	switch n.Val.(type) {
 	case *fullNode, *shortNode:
 		collapsed.Val, cached.Val = h.hash(n.Val, false)
 	}
+
 	return collapsed, cached
 }
 
 // @return collapsed 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 为 Compact 编码；
-//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
+//   如果原来的 Val 为 分支节点 和 扩展节点，Val 将变为 hashNode
 // @return cached 是递归过程中新构建的一棵树，树结构与原来的 t.root 一致，Key 保持 HEX 编码不变；
-//   如果原来的 Val 为 分支节点 和 扩展节点，将变为 hashNode
+//   如果原来的 Val 为 分支节点 和 扩展节点，Val 不变，flags.hash 将记录当前子树 n 的 merkle tree
 func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached *fullNode) {
 	// Hash the full node's children, caching the newly hashed subtrees
 	cached = n.copy()
@@ -203,9 +206,11 @@ func (h *hasher) hashData(data []byte) hashNode {
 }
 
 // proofHash is used to construct trie proofs, and returns the 'collapsed'
-// node (for later RLP encoding) aswell as the hashed node -- unless the
+// node (for later RLP encoding) as well as the hashed node -- unless the
 // node is smaller than 32 bytes, in which case it will be returned as is.
 // This method does not do anything on value- or hash-nodes.
+// @return 坍缩后的节点，以及 hashNode
+// 与函数 hasher.hash() 的代码有些相似
 func (h *hasher) proofHash(original node) (collapsed, hashed node) {
 	switch n := original.(type) {
 	case *shortNode:
@@ -215,7 +220,7 @@ func (h *hasher) proofHash(original node) (collapsed, hashed node) {
 		fn, _ := h.hashFullNodeChildren(n)
 		return fn, h.fullnodeToHash(fn, false)
 	default:
-		// Value and hash nodes don't have children so they're left as were
+		// Value and hash nodes don't have children, so they're left as were
 		return n, n
 	}
 }

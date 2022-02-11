@@ -31,12 +31,14 @@ import (
 // specifying a particular key range for deletion.
 //
 // Origin is included for wiping and limit is excluded if they are specified.
+// 从 diskdb 中找到并删除索引以 prefix 开头，长度为 keylen 的数据
 func wipeKeyRange(db ethdb.KeyValueStore, kind string, prefix []byte, origin []byte, limit []byte, keylen int, meter metrics.Meter, report bool) error {
 	// Batch deletions together to avoid holding an iterator for too long
 	var (
 		batch = db.NewBatch()
 		items int
 	)
+
 	// Iterate over the key-range and delete all of them
 	start, logged := time.Now(), time.Now()
 
@@ -45,6 +47,7 @@ func wipeKeyRange(db ethdb.KeyValueStore, kind string, prefix []byte, origin []b
 	if limit != nil {
 		stop = append(prefix, limit...)
 	}
+
 	for it.Next() {
 		// Skip any keys with the correct prefix but wrong length (trie nodes)
 		key := it.Key()
@@ -57,6 +60,7 @@ func wipeKeyRange(db ethdb.KeyValueStore, kind string, prefix []byte, origin []b
 		if stop != nil && bytes.Compare(key, stop) >= 0 {
 			break
 		}
+
 		// Delete the key and periodically recreate the batch and iterator
 		batch.Delete(key)
 		items++
@@ -77,13 +81,16 @@ func wipeKeyRange(db ethdb.KeyValueStore, kind string, prefix []byte, origin []b
 			}
 		}
 	}
+
 	it.Release()
 	if err := batch.Write(); err != nil {
 		return err
 	}
+
 	if meter != nil {
 		meter.Mark(int64(items))
 	}
+
 	if report {
 		log.Info("Deleted state snapshot leftovers", "kind", kind, "wiped", items, "elapsed", common.PrettyDuration(time.Since(start)))
 	}

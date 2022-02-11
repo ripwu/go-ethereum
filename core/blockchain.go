@@ -1209,7 +1209,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 
 	// If we're running an archive node, always flush
 	// 配置来自启动参数 flag gcmode: Blockchain garbage collection mode ("full", "archive")，默认为 full
-	// 此时 TrieDirtyDisabled 为 false，因此默认启动时，区块对应的 State Trie 默认不会由 triedb.Commit() 写入磁盘
+	// 此时 TrieDirtyDisabled 为 false，因此在按默认参数启动的情况下，区块对应的 State Trie 不会由 triedb.Commit() 写入磁盘
 	if bc.cacheConfig.TrieDirtyDisabled {
 		// 将 Database.dirties 实际落盘
 		return triedb.Commit(root, false, nil)

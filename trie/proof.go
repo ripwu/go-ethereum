@@ -35,16 +35,21 @@ import (
 // If the trie does not contain a value for key, the returned proof contains all
 // nodes of the longest existing prefix of the key (at least the root node), ending
 // with the node that proves the absence of the key.
+// 遍历从根 root 到 key 的路径上的节点，以 hash -> RLP(collapsed) 的形式记录在 proofDb 中
+// 注意 key 可能不存在 trie 中，此时 proofDb 中包括从根 root 到 trie 中存在的 key 最长子串 的路径
+// @return error 仅在 resolveHash() 失败时返回 MissingNodeError
 func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) error {
 	// Collect all nodes on the path to key.
 	key = keybytesToHex(key)
+
+	// 1.收集从 t.root 到 key 路径上的所有 nodes
 	var nodes []node
 	tn := t.root
 	for len(key) > 0 && tn != nil {
 		switch n := tn.(type) {
 		case *shortNode:
 			if len(key) < len(n.Key) || !bytes.Equal(n.Key, key[:len(n.Key)]) {
-				// The trie doesn't contain the key.
+				// The trie doesn't contain the key. 不存在
 				tn = nil
 			} else {
 				tn = n.Val
@@ -66,14 +71,18 @@ func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) e
 			panic(fmt.Sprintf("%T: invalid node: %v", tn, tn))
 		}
 	}
+
 	hasher := newHasher(false)
 	defer returnHasherToPool(hasher)
 
+	// 2.遍历 nodes，得到 collapsed 节点 和 hash
+	// 编码 collapsed 节点作为值，以 hash 作为索引，记录在 proofDb 内存数据库中
 	for i, n := range nodes {
 		if fromLevel > 0 {
 			fromLevel--
 			continue
 		}
+
 		var hn node
 		n, hn = hasher.proofHash(n)
 		if hash, ok := hn.(hashNode); ok || i == 0 {
@@ -83,9 +92,11 @@ func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) e
 			if !ok {
 				hash = hasher.hashData(enc)
 			}
+
 			proofDb.Put(hash, enc)
 		}
 	}
+
 	return nil
 }
 
@@ -106,15 +117,19 @@ func (t *SecureTrie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWri
 func VerifyProof(rootHash common.Hash, key []byte, proofDb ethdb.KeyValueReader) (value []byte, err error) {
 	key = keybytesToHex(key)
 	wantHash := rootHash
+
+	// 逐层 解码，查询
 	for i := 0; ; i++ {
 		buf, _ := proofDb.Get(wantHash[:])
 		if buf == nil {
 			return nil, fmt.Errorf("proof node %d (hash %064x) missing", i, wantHash)
 		}
+
 		n, err := decodeNode(wantHash[:], buf)
 		if err != nil {
 			return nil, fmt.Errorf("bad proof node %d: %v", i, err)
 		}
+
 		keyrest, cld := get(n, key, true)
 		switch cld := cld.(type) {
 		case nil:
@@ -124,6 +139,7 @@ func VerifyProof(rootHash common.Hash, key []byte, proofDb ethdb.KeyValueReader)
 			key = keyrest
 			copy(wantHash[:], cld)
 		case valueNode:
+			// 叶子节点，查找结束
 			return cld, nil
 		}
 	}
@@ -134,6 +150,8 @@ func VerifyProof(rootHash common.Hash, key []byte, proofDb ethdb.KeyValueReader)
 // necessary nodes will be resolved and leave the remaining as hashnode.
 //
 // The given edge proof is allowed to be an existent or non-existent proof.
+// 功能：通过 proofDb 数据构造从 rootHash 指向 key 的路径，得到一棵树，返回其根节点 node
+// @return []byte key 对应的叶子节点的值
 func proofToPath(rootHash common.Hash, root node, key []byte, proofDb ethdb.KeyValueReader, allowNonExistent bool) (node, []byte, error) {
 	// resolveNode retrieves and resolves trie node from merkle proof stream
 	resolveNode := func(hash common.Hash) (node, error) {
@@ -147,6 +165,7 @@ func proofToPath(rootHash common.Hash, root node, key []byte, proofDb ethdb.KeyV
 		}
 		return n, err
 	}
+
 	// If the root node is empty, resolve it first.
 	// Root node must be included in the proof.
 	if root == nil {
@@ -156,12 +175,14 @@ func proofToPath(rootHash common.Hash, root node, key []byte, proofDb ethdb.KeyV
 		}
 		root = n
 	}
+
 	var (
 		err           error
 		child, parent node
 		keyrest       []byte
 		valnode       []byte
 	)
+
 	key, parent = keybytesToHex(key), root
 	for {
 		keyrest, child = get(parent, key, false)
@@ -174,6 +195,7 @@ func proofToPath(rootHash common.Hash, root node, key []byte, proofDb ethdb.KeyV
 			if allowNonExistent {
 				return root, nil, nil
 			}
+
 			return nil, nil, errors.New("the node is not contained in trie")
 		case *shortNode:
 			key, parent = keyrest, child // Already resolved
@@ -189,6 +211,7 @@ func proofToPath(rootHash common.Hash, root node, key []byte, proofDb ethdb.KeyV
 		case valueNode:
 			valnode = cld
 		}
+
 		// Link the parent and child.
 		switch pnode := parent.(type) {
 		case *shortNode:
@@ -198,9 +221,11 @@ func proofToPath(rootHash common.Hash, root node, key []byte, proofDb ethdb.KeyV
 		default:
 			panic(fmt.Sprintf("%T: invalid node: %v", pnode, pnode))
 		}
+
 		if len(valnode) > 0 {
 			return root, valnode, nil // The whole path is resolved
 		}
+
 		key, parent = keyrest, child
 	}
 }
@@ -231,6 +256,7 @@ func unsetInternal(n node, left []byte, right []byte) (bool, error) {
 		// fork indicator, 0 means no fork, -1 means proof is less, 1 means proof is greater
 		shortForkLeft, shortForkRight int
 	)
+
 findFork:
 	for {
 		switch rn := (n).(type) {
@@ -244,14 +270,17 @@ findFork:
 			} else {
 				shortForkLeft = bytes.Compare(left[pos:pos+len(rn.Key)], rn.Key)
 			}
+
 			if len(right)-pos < len(rn.Key) {
 				shortForkRight = bytes.Compare(right[pos:], rn.Key)
 			} else {
 				shortForkRight = bytes.Compare(right[pos:pos+len(rn.Key)], rn.Key)
 			}
+
 			if shortForkLeft != 0 || shortForkRight != 0 {
 				break findFork
 			}
+
 			parent = n
 			n, pos = rn.Val, pos+len(rn.Key)
 		case *fullNode:
@@ -269,6 +298,7 @@ findFork:
 			panic(fmt.Sprintf("%T: invalid node: %v", n, n))
 		}
 	}
+
 	switch rn := n.(type) {
 	case *shortNode:
 		// There can have these five scenarios:
@@ -365,7 +395,7 @@ func unset(parent node, child node, key []byte, pos int, removeLeft bool) error 
 			if removeLeft {
 				if bytes.Compare(cld.Key, key[pos:]) < 0 {
 					// The key of fork shortnode is less than the path
-					// (it belongs to the range), unset the entrie
+					// (it belongs to the range), unset the entire
 					// branch. The parent must be a fullnode.
 					fn := parent.(*fullNode)
 					fn.Children[key[pos-1]] = nil
@@ -377,7 +407,7 @@ func unset(parent node, child node, key []byte, pos int, removeLeft bool) error 
 			} else {
 				if bytes.Compare(cld.Key, key[pos:]) > 0 {
 					// The key of fork shortnode is greater than the
-					// path(it belongs to the range), unset the entrie
+					// path(it belongs to the range), unset the entire
 					// branch. The parent must be a fullnode.
 					fn := parent.(*fullNode)
 					fn.Children[key[pos-1]] = nil
@@ -409,6 +439,7 @@ func unset(parent node, child node, key []byte, pos int, removeLeft bool) error 
 // on the right side of the given path. The given path can point to an existent
 // key or a non-existent one. This function has the assumption that the whole
 // path should already be resolved.
+// 返回：在 node 表示树中，key 是否非最右路径，即：是否存在比 key 更靠右的路径
 func hasRightElement(node node, key []byte) bool {
 	pos, key := 0, keybytesToHex(key)
 	for node != nil {
@@ -431,6 +462,7 @@ func hasRightElement(node node, key []byte) bool {
 			panic(fmt.Sprintf("%T: invalid node: %v", node, node)) // hashnode
 		}
 	}
+
 	return false
 }
 
@@ -472,17 +504,21 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 	if len(keys) != len(values) {
 		return false, fmt.Errorf("inconsistent proof data, keys: %d, values: %d", len(keys), len(values))
 	}
+
+	// 验证 keys 单调递增
 	// Ensure the received batch is monotonic increasing and contains no deletions
 	for i := 0; i < len(keys)-1; i++ {
 		if bytes.Compare(keys[i], keys[i+1]) >= 0 {
 			return false, errors.New("range is not monotonically increasing")
 		}
 	}
+
 	for _, value := range values {
 		if len(value) == 0 {
 			return false, errors.New("range contains deletion")
 		}
 	}
+
 	// Special case, there is no edge proof at all. The given range is expected
 	// to be the whole leaf-set in the trie.
 	if proof == nil {
@@ -495,6 +531,7 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 		}
 		return false, nil // No more elements
 	}
+
 	// Special case, there is a provided edge proof but zero key/value
 	// pairs, ensure there are no more accounts / slots in the trie.
 	if len(keys) == 0 {
@@ -507,6 +544,7 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 		}
 		return false, nil
 	}
+
 	// Special case, there is only one element and two edge keys are same.
 	// In this case, we can't construct two edge paths. So handle it here.
 	if len(keys) == 1 && bytes.Equal(firstKey, lastKey) {
@@ -522,15 +560,18 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 		}
 		return hasRightElement(root, firstKey), nil
 	}
+
 	// Ok, in all other cases, we require two edge paths available.
 	// First check the validity of edge keys.
 	if bytes.Compare(firstKey, lastKey) >= 0 {
 		return false, errors.New("invalid edge keys")
 	}
+
 	// todo(rjl493456442) different length edge keys should be supported
 	if len(firstKey) != len(lastKey) {
 		return false, errors.New("inconsistent edge keys")
 	}
+
 	// Convert the edge proofs to edge trie paths. Then we can
 	// have the same tree architecture with the original one.
 	// For the first edge proof, non-existent proof is allowed.
@@ -538,6 +579,7 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 	if err != nil {
 		return false, err
 	}
+
 	// Pass the root node here, the second path will be merged
 	// with the first one. For the last edge proof, non-existent
 	// proof is also allowed.
@@ -545,24 +587,29 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 	if err != nil {
 		return false, err
 	}
+
 	// Remove all internal references. All the removed parts should
 	// be re-filled(or re-constructed) by the given leaves range.
 	empty, err := unsetInternal(root, firstKey, lastKey)
 	if err != nil {
 		return false, err
 	}
+
 	// Rebuild the trie with the leaf stream, the shape of trie
 	// should be same with the original one.
 	tr := &Trie{root: root, db: NewDatabase(memorydb.New())}
 	if empty {
 		tr.root = nil
 	}
+
 	for index, key := range keys {
 		tr.TryUpdate(key, values[index])
 	}
+
 	if tr.Hash() != rootHash {
 		return false, fmt.Errorf("invalid proof, want hash %x, got %x", rootHash, tr.Hash())
 	}
+
 	return hasRightElement(tr.root, keys[len(keys)-1]), nil
 }
 
@@ -578,6 +625,7 @@ func get(tn node, key []byte, skipResolved bool) ([]byte, node) {
 			if len(key) < len(n.Key) || !bytes.Equal(n.Key, key[:len(n.Key)]) {
 				return nil, nil
 			}
+
 			tn = n.Val
 			key = key[len(n.Key):]
 			if !skipResolved {
