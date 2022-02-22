@@ -32,9 +32,16 @@ import (
 
 var (
 	// emptyRoot is the known root hash of an empty trie.
+	// b := new(bytes.Buffer)
+	// rlp.Encode(b, nilValueNode) // => b.Bytes(): 0x80
+	// emptyTrie := crypto.Keccak256Hash(b.Bytes())
+	// fmt.Printf("TestEmptyTrieHash emptyTrie %s\n", emptyTrie.Hex())
 	emptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
 	// emptyState is the known hash of an empty state trie entry.
+	// EOA.codeHash: c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+	// emptyState := crypto.Keccak256Hash(nil)
+	// fmt.Printf("TestEmptyTrieHash emptyState %s\n", emptyState.Hex())
 	emptyState = crypto.Keccak256Hash(nil)
 )
 

@@ -38,6 +38,8 @@ import (
 // 遍历从根 root 到 key 的路径上的节点，以 hash -> RLP(collapsed) 的形式记录在 proofDb 中
 // 注意 key 可能不存在 trie 中，此时 proofDb 中包括从根 root 到 trie 中存在的 key 最长子串 的路径
 // @return error 仅在 resolveHash() 失败时返回 MissingNodeError
+// 例子：
+// [State trie does not include account balance #1947](https://github.com/ethereum-optimism/optimism/issues/1947)
 func (t *Trie) Prove(key []byte, fromLevel uint, proofDb ethdb.KeyValueWriter) error {
 	// Collect all nodes on the path to key.
 	key = keybytesToHex(key)
@@ -575,6 +577,7 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 	// Convert the edge proofs to edge trie paths. Then we can
 	// have the same tree architecture with the original one.
 	// For the first edge proof, non-existent proof is allowed.
+	// 用 proof 数据构造从 nil 指向 firstKey 的路径，得到一棵树，根节点为 root
 	root, _, err := proofToPath(rootHash, nil, firstKey, proof, true)
 	if err != nil {
 		return false, err
@@ -583,6 +586,7 @@ func VerifyRangeProof(rootHash common.Hash, firstKey []byte, lastKey []byte, key
 	// Pass the root node here, the second path will be merged
 	// with the first one. For the last edge proof, non-existent
 	// proof is also allowed.
+	// 基于上面得到的树，继续构造从 root 到 lastKey 的路径
 	root, _, err = proofToPath(rootHash, root, lastKey, proof, true)
 	if err != nil {
 		return false, err

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/rlp"
@@ -173,4 +174,16 @@ func TestInsert3(t *testing.T) {
 	if root != exp {
 		t.Errorf("case 2: exp %x got %x", exp, root)
 	}
+}
+
+func TestEmptyHash(t *testing.T) {
+	// 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+	emptyState := crypto.Keccak256Hash(nil)
+	fmt.Printf("TestEmptyTrieHash emptyState %s\n", emptyState.Hex())
+
+	// 0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421
+	b := new(bytes.Buffer)
+	rlp.Encode(b, nilValueNode)
+	emptyTrie := crypto.Keccak256Hash(b.Bytes())
+	fmt.Printf("TestEmptyTrieHash emptyTrie %s\n", emptyTrie.Hex())
 }

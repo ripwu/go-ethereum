@@ -166,7 +166,7 @@ func decodeShort(hash, elems []byte) (node, error) {
 		return nil, err
 	}
 
-	// 注意这里新建的 nodeFlag 默认 dirty 为 false
+	// 设置 flag.hash 为 hash，dirty 为默认值 false
 	flag := nodeFlag{hash: hash}
 	key := compactToHex(kbuf)
 
