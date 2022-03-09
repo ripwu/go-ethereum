@@ -195,6 +195,7 @@ type extblock struct {
 // The values of TxHash, UncleHash, ReceiptHash and Bloom in header
 // are ignored and set to values derived from the given txs, uncles
 // and receipts.
+// 计算区块头的 TxHash 和 ReceiptHash
 func NewBlock(header *Header, txs []*Transaction, uncles []*Header, receipts []*Receipt, hasher TrieHasher) *Block {
 	b := &Block{header: CopyHeader(header), td: new(big.Int)}
 

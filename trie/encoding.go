@@ -54,7 +54,7 @@ func hexToCompact(hex []byte) []byte {
 	buf[0] = terminator << 5 // the flag byte
 
 	// 根据黄皮书，要处理奇偶的原因，主要是为了让数据长度正好为偶数
-	// 理解如下：如果不处理奇偶，编码时因为 nibbles 两辆组队，因此对于奇数长度的 hex，最后一个字符 nibble 无人配对，
+	// 理解如下：如果不处理奇偶，编码时因为 nibbles 两两组队，因此对于奇数长度的 hex，最后一个字符 nibble 无人配对，
 	// 此时它只能在高 16 位，与低16位的 0 组成一个字节；解码时，无法确认低 16 位的 0，是原有数据还是 padding 数据
 	if len(hex)&1 == 1 {
 		buf[0] |= 1 << 4 // odd flag

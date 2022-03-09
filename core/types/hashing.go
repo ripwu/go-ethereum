@@ -94,20 +94,27 @@ func DeriveSha(list DerivableList, hasher TrieHasher) common.Hash {
 	// order that `list` provides hashes in. This insertion sequence ensures that the
 	// order is correct.
 	var indexBuf []byte
+
+	// 中序
+
+	// 左边 [1, 0x7f]
 	for i := 1; i < list.Len() && i <= 0x7f; i++ {
 		indexBuf = rlp.AppendUint64(indexBuf[:0], uint64(i))
 		value := encodeForDerive(list, i, valueBuf)
 		hasher.Update(indexBuf, value)
 	}
+	// 中间 [0, 0]
 	if list.Len() > 0 {
 		indexBuf = rlp.AppendUint64(indexBuf[:0], 0)
 		value := encodeForDerive(list, 0, valueBuf)
 		hasher.Update(indexBuf, value)
 	}
+	// 右边 [0x80-]
 	for i := 0x80; i < list.Len(); i++ {
 		indexBuf = rlp.AppendUint64(indexBuf[:0], uint64(i))
 		value := encodeForDerive(list, i, valueBuf)
 		hasher.Update(indexBuf, value)
 	}
+
 	return hasher.Hash()
 }

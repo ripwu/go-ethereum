@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+// 进展参考 [Ethereum Proof-of-Stake and Our Solar Punk Future - Danny Ryan](https://www.youtube.com/watch?v=8N10a1EBhBc)
+
 // Package catalyst implements the temporary eth1/eth2 RPC integration.
 package catalyst
 

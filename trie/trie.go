@@ -135,7 +135,11 @@ func (t *Trie) TryGet(key []byte) ([]byte, error) {
 }
 
 // @param pos 路径匹配到哪了
-// @return disResolve 看起来只在 hashNode 中展开子树时返回 true，表示从 db 中加载了新的节点
+// @return
+//	 - disResolve 看起来只在 hashNode 中展开子树时返回 true，表示从 db 中加载了新的节点
+//   - err
+//      - key 不存在时，返回 err 为 nil
+//      - node 无法 resolve 时(在数据库中找不到)，返回 err 为 MissingNodeError
 func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode node, didResolve bool, err error) {
 	switch n := (origNode).(type) {
 	case nil:
@@ -151,6 +155,7 @@ func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode
 			// key not found in trie
 			return nil, n, false, nil
 		}
+
 		value, newnode, didResolve, err = t.tryGet(n.Val, key, pos+len(n.Key))
 		if err == nil && didResolve {
 			n = n.copy()
@@ -172,6 +177,7 @@ func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode
 		if err != nil {
 			return nil, n, true, err
 		}
+
 		// 在子树中继续查找
 		value, newnode, _, err := t.tryGet(child, key, pos)
 		return value, newnode, true, err
